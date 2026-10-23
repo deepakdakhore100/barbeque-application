@@ -155,6 +155,8 @@ export default defineConfig(() => {
     )
   );
 
+  zip.file('.npmrc', 'legacy-peer-deps=true\n');
+
   zip.file(
     '.gitignore',
     `node_modules
