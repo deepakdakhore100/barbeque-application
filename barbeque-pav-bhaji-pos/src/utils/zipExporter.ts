@@ -15,7 +15,8 @@ export async function downloadProjectZip() {
         scripts: {
           dev: 'vite --port=3000 --host=0.0.0.0',
           build: 'vite build',
-          preview: 'vite preview',
+          preview: 'vite preview --port=${PORT:-3000} --host=0.0.0.0',
+          start: 'vite build && node server.js',
           lint: 'tsc --noEmit',
         },
         dependencies: {
@@ -164,6 +165,40 @@ dist
 .env
 *.local
 .DS_Store`
+  );
+
+  zip.file(
+    'server.js',
+    `import express from 'express';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import fs from 'fs';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+const distPath = path.join(__dirname, 'dist');
+app.use(express.static(distPath));
+
+app.get('/health', (req, res) => {
+  res.status(200).json({ status: 'healthy', timestamp: new Date().toISOString() });
+});
+
+app.get('*', (req, res) => {
+  const indexPath = path.join(distPath, 'index.html');
+  if (fs.existsSync(indexPath)) {
+    res.sendFile(indexPath);
+  } else {
+    res.status(500).send('Production build not found. Please run "npm run build".');
+  }
+});
+
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(\`Barbeque Pav Bhaji POS server running on port \${PORT}\`);
+});`
   );
 
   zip.file(
