@@ -29,7 +29,8 @@ export async function downloadProjectZip() {
           motion: '^12.23.24',
           react: '^19.0.1',
           'react-dom': '^19.0.1',
-          recharts: '^2.15.0',
+          'react-is': '^19.3.1',
+          recharts: '^3.10.1',
           tailwindcss: '^4.3.3',
           vite: '^8.3.0',
         },
@@ -117,7 +118,7 @@ export default defineConfig(() => {
     plugins: [react(), tailwindcss()],
     resolve: {
       alias: {
-        '@': path.resolve(__dirname, '.'),
+        '@': path.resolve(import.meta.dirname || '.', '.'),
       },
     },
     server: {
