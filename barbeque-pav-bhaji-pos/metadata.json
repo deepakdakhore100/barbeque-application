@@ -1,0 +1,6 @@
+{
+  "name": "Barbeque Pav Bhaji POS",
+  "description": "Restaurant POS with in-dine captain tablet ordering, real-time kitchen display (KDS), Zomato online order approval and dispatch, bulk catering manager, and live inventory tracking.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
