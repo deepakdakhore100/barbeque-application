@@ -203,6 +203,70 @@ export const DatabaseExplorerView: React.FC = () => {
         </div>
       </div>
 
+      {/* Connection Diagnostic Alert if disconnected */}
+      {dbStatus && !dbStatus.connected && (
+        <div className="p-4 bg-rose-950/40 border border-rose-800/60 rounded-2xl text-xs space-y-3">
+          <div className="flex items-start gap-2.5">
+            <AlertCircle className="w-5 h-5 text-rose-400 shrink-0 mt-0.5" />
+            <div>
+              <span className="font-bold text-rose-200 text-sm block">
+                PostgreSQL Connection Notice
+              </span>
+              <p className="text-rose-300/90 mt-1">
+                {dbStatus.error || 'Cannot authenticate with Neon PostgreSQL.'}
+              </p>
+              {dbStatus.error?.includes('password authentication failed') && (
+                <p className="text-neutral-300 mt-2 bg-black/40 p-2.5 rounded-xl border border-rose-900/50">
+                  💡 <strong>How to resolve:</strong> Neon accounts automatically rotate or generate new passwords when a branch is reset. Go to <a href="https://console.neon.tech" target="_blank" rel="noreferrer" className="text-amber-400 underline font-semibold">console.neon.tech</a>, click <strong>&quot;Connection Details&quot;</strong>, copy your connection string, and paste it below.
+                </p>
+              )}
+            </div>
+          </div>
+
+          {/* Direct Connection String Updater */}
+          <form
+            onSubmit={async (e) => {
+              e.preventDefault();
+              const form = e.target as HTMLFormElement;
+              const input = form.elements.namedItem('conn') as HTMLInputElement;
+              if (!input.value.trim()) return;
+              try {
+                const res = await fetch('/api/database/config', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ connectionString: input.value.trim() }),
+                });
+                const data = await res.json();
+                if (data.connected || data.success) {
+                  alert('Connected to PostgreSQL successfully!');
+                  fetchStatus();
+                  handleRunQuery();
+                } else {
+                  alert(`Connection failed: ${data.error || 'Check credentials'}`);
+                }
+              } catch (err: any) {
+                alert(`Error: ${err.message}`);
+              }
+            }}
+            className="flex flex-col sm:flex-row gap-2 pt-2 border-t border-rose-900/40"
+          >
+            <input
+              name="conn"
+              type="text"
+              placeholder="Paste updated postgresql://neondb_owner:PASSWORD@.../neondb?sslmode=require"
+              defaultValue={neonConnectionString}
+              className="flex-1 bg-black border border-neutral-700 text-white font-mono text-[11px] rounded-xl px-3 py-2 focus:outline-none focus:border-amber-500"
+            />
+            <button
+              type="submit"
+              className="px-4 py-2 bg-amber-500 hover:bg-amber-400 text-neutral-950 font-bold text-xs rounded-xl shrink-0 transition-colors"
+            >
+              Update &amp; Reconnect
+            </button>
+          </form>
+        </div>
+      )}
+
       {syncMessage && (
         <div className="p-3 bg-amber-950/30 border border-amber-900/40 text-amber-300 text-xs rounded-xl flex items-center gap-2">
           <CheckCircle2 className="w-4 h-4 text-amber-400" />

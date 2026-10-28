@@ -3,7 +3,15 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
 import { createServer as createViteServer } from 'vite';
-import { pool, query, testConnection, initDatabaseSchema, seedInitialDataIfEmpty } from './src/server/db.ts';
+import {
+  pool,
+  query,
+  testConnection,
+  initDatabaseSchema,
+  insertOrderRecord,
+  setDatabaseUrl,
+  getMaskedConnectionString,
+} from './src/server/db.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -15,41 +23,42 @@ async function bootstrap() {
   const app = express();
   app.use(express.json());
 
-  // Auto-initialize Neon PostgreSQL tables in the background
+  // Auto-initialize Neon PostgreSQL tables
   initDatabaseSchema()
-    .then(async () => {
-      console.log('Neon PostgreSQL tables initialized successfully.');
-      await seedInitialDataIfEmpty();
-    })
-    .catch((err) => {
-      console.warn('Neon PostgreSQL auto-init notice:', err.message || err);
-    });
-
-  // =========================================================================
-  // API Routes: PostgreSQL Database Operations & Queries
-  // =========================================================================
+    .then(() => console.log('PostgreSQL tables initialized.'))
+    .catch((err) => console.warn('PostgreSQL init note:', err.message || err));
 
   // 1. Health & Connection Status
   app.get('/api/database/status', async (req, res) => {
     try {
       const conn = await testConnection();
-      if (!conn.connected) {
-        return res.status(500).json(conn);
+      let totalOrders = 0;
+      let totalTables = 0;
+      let totalRevenue = 0;
+
+      if (conn.connected) {
+        try {
+          const ordersCountRes = await query('SELECT count(*) as total_orders FROM orders');
+          totalOrders = parseInt((ordersCountRes.rows[0] as any).total_orders, 10);
+        } catch {}
+
+        try {
+          const tablesCountRes = await query('SELECT count(*) as total_tables FROM dining_tables');
+          totalTables = parseInt((tablesCountRes.rows[0] as any).total_tables, 10);
+        } catch {}
+
+        try {
+          const revenueRes = await query('SELECT COALESCE(SUM(total), 0) as total_revenue FROM orders');
+          totalRevenue = parseFloat((revenueRes.rows[0] as any).total_revenue);
+        } catch {}
       }
 
-      // Query table statistics
-      const ordersCountRes = await query('SELECT count(*) as total_orders FROM orders');
-      const tablesCountRes = await query('SELECT count(*) as total_tables FROM dining_tables');
-      const menuCountRes = await query('SELECT count(*) as total_menu FROM menu_items');
-      const revenueRes = await query('SELECT COALESCE(SUM(total), 0) as total_revenue FROM orders');
-
-      res.json({
+      res.status(conn.connected ? 200 : 500).json({
         ...conn,
         stats: {
-          totalOrders: parseInt(ordersCountRes.rows[0].total_orders, 10),
-          totalTables: parseInt(tablesCountRes.rows[0].total_tables, 10),
-          totalMenuItems: parseInt(menuCountRes.rows[0].total_menu, 10),
-          totalRevenue: parseFloat(revenueRes.rows[0].total_revenue),
+          totalOrders,
+          totalTables,
+          totalRevenue,
         },
       });
     } catch (err: any) {
@@ -57,27 +66,23 @@ async function bootstrap() {
     }
   });
 
-  // 2. Initialize Schema
-  app.post('/api/database/init', async (req, res) => {
+  // 2. Update Connection String Dynamically
+  app.post('/api/database/config', async (req, res) => {
+    const { connectionString } = req.body;
+    if (!connectionString) return res.status(400).json({ error: 'Connection string is required' });
+
     try {
-      const result = await initDatabaseSchema();
-      res.json(result);
+      const conn = await setDatabaseUrl(connectionString);
+      if (conn.connected) {
+        await initDatabaseSchema();
+      }
+      res.json(conn);
     } catch (err: any) {
-      res.status(500).json({ error: err.message || String(err) });
+      res.status(400).json({ connected: false, error: err.message || String(err) });
     }
   });
 
-  // 3. Seed Database
-  app.post('/api/database/seed', async (req, res) => {
-    try {
-      const result = await seedInitialDataIfEmpty();
-      res.json(result);
-    } catch (err: any) {
-      res.status(500).json({ error: err.message || String(err) });
-    }
-  });
-
-  // 4. Interactive SQL Query Runner (SELECT, SHOW, EXPLAIN)
+  // 3. Interactive SQL Query Runner
   app.post('/api/database/query', async (req, res) => {
     const { sql } = req.body;
     if (!sql || typeof sql !== 'string') {
@@ -102,9 +107,10 @@ async function bootstrap() {
     }
   });
 
-  // 5. Fetch Live Orders from PostgreSQL
+  // 4. Fetch Live Orders
   app.get('/api/orders', async (req, res) => {
     try {
+      await initDatabaseSchema();
       const ordersRes = await query(`
         SELECT 
           o.*,
@@ -112,15 +118,11 @@ async function bootstrap() {
             json_agg(
               json_build_object(
                 'id', oi.id,
-                'menuItemId', oi.menu_item_id,
                 'name', oi.name,
                 'price', oi.price,
                 'quantity', oi.quantity,
                 'spiceLevel', oi.spice_level,
                 'butterPreference', oi.butter_preference,
-                'pavType', oi.pav_type,
-                'exclusions', oi.exclusions,
-                'specialNotes', oi.special_notes,
                 'itemStatus', oi.item_status
               )
             ) FILTER (WHERE oi.id IS NOT NULL), '[]'
@@ -137,7 +139,7 @@ async function bootstrap() {
     }
   });
 
-  // 6. Create New Order in PostgreSQL
+  // 5. Create / Sync Order in PostgreSQL
   app.post('/api/orders', async (req, res) => {
     const { order } = req.body;
     if (!order) {
@@ -145,69 +147,10 @@ async function bootstrap() {
     }
 
     try {
-      await pool.query('BEGIN');
-
-      const insertOrderSql = `
-        INSERT INTO orders (
-          id, order_number, order_type, table_id, table_number, captain_name,
-          customer_name, customer_phone, status, subtotal, tax, discount, service_charge,
-          total, special_instructions, kot_fired_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
-        ON CONFLICT (id) DO UPDATE SET
-          status = EXCLUDED.status,
-          total = EXCLUDED.total
-      `;
-
-      await pool.query(insertOrderSql, [
-        order.id,
-        order.orderNumber,
-        order.type || 'in_dine',
-        order.tableId || null,
-        order.tableNumber || null,
-        order.captainName || null,
-        order.customerName || null,
-        order.customerPhone || null,
-        order.status || 'sent_to_kitchen',
-        order.subtotal,
-        order.tax,
-        order.discount || 0,
-        order.serviceCharge || 0,
-        order.total,
-        order.specialInstructions || null,
-        order.kotFiredAt || new Date().toISOString(),
-      ]);
-
-      if (order.items && Array.isArray(order.items)) {
-        for (const item of order.items) {
-          await pool.query(
-            `INSERT INTO order_items (
-              id, order_id, menu_item_id, name, price, quantity,
-              spice_level, butter_preference, pav_type, exclusions, special_notes, item_status
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-            ON CONFLICT (id) DO UPDATE SET item_status = EXCLUDED.item_status`,
-            [
-              item.id,
-              order.id,
-              item.menuItemId,
-              item.name,
-              item.price,
-              item.quantity,
-              item.customization?.spiceLevel || 'Medium',
-              item.customization?.butterPreference || 'Normal Butter',
-              item.customization?.pavType || 'Standard Butter Pav',
-              item.customization?.exclusions || [],
-              item.customization?.specialNotes || null,
-              item.itemStatus || 'pending',
-            ]
-          );
-        }
-      }
-
-      await pool.query('COMMIT');
-      res.json({ success: true, orderId: order.id });
+      const result = await insertOrderRecord(order);
+      res.json(result);
     } catch (err: any) {
-      await pool.query('ROLLBACK');
-      res.status(500).json({ error: err.message || String(err) });
+      res.status(500).json({ success: false, error: err.message || String(err) });
     }
   });
 
@@ -216,9 +159,7 @@ async function bootstrap() {
     res.status(200).json({ status: 'healthy', timestamp: new Date().toISOString() });
   });
 
-  // =========================================================================
-  // Frontend Serving (Dev via Vite middlewares, Prod via dist)
-  // =========================================================================
+  // Frontend Serving
   if (!isProduction) {
     const vite = await createViteServer({
       server: { middlewareMode: true },

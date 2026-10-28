@@ -143,6 +143,56 @@ export const POSProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setActivePaymentOrderId(null);
   };
 
+  // Initial sync from PostgreSQL backend
+  useEffect(() => {
+    fetch('/api/orders')
+      .then((res) => (res.ok ? res.json() : []))
+      .then((pgOrders) => {
+        if (Array.isArray(pgOrders) && pgOrders.length > 0) {
+          // Merge PostgreSQL orders with local orders
+          setOrders((prev) => {
+            const existingIds = new Set(prev.map((o) => o.id));
+            const newFromPg = pgOrders
+              .filter((p: any) => !existingIds.has(p.id))
+              .map((p: any) => ({
+                id: p.id,
+                orderNumber: p.order_number || p.orderNumber,
+                type: p.order_type || p.type || 'in_dine',
+                tableId: p.table_id || p.tableId,
+                tableNumber: p.table_number || p.tableNumber,
+                captainName: p.captain_name || p.captainName,
+                customerName: p.customer_name || p.customerName,
+                customerPhone: p.customer_phone || p.customerPhone,
+                createdAt: p.created_at || p.createdAt,
+                status: p.status,
+                items: p.items || [],
+                subtotal: parseFloat(p.subtotal) || 0,
+                tax: parseFloat(p.tax) || 0,
+                discount: parseFloat(p.discount) || 0,
+                serviceCharge: parseFloat(p.service_charge) || 0,
+                total: parseFloat(p.total) || 0,
+                specialInstructions: p.special_instructions || p.specialInstructions,
+              }));
+            return [...prev, ...newFromPg];
+          });
+        }
+      })
+      .catch(() => {});
+  }, []);
+
+  // Helper to send order to PostgreSQL backend
+  const syncOrderToBackend = async (order: any) => {
+    try {
+      await fetch('/api/orders', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ order }),
+      });
+    } catch {
+      // Offline fallback
+    }
+  };
+
   // Helper to calculate totals
   const calculateOrderTotals = (items: OrderItem[]) => {
     const subtotal = items.reduce((sum, item) => sum + item.price * item.quantity, 0);
@@ -239,15 +289,7 @@ export const POSProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     deductInventoryForOrder(items);
 
     // Sync to PostgreSQL database in background
-    try {
-      fetch('/api/orders', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ order: newOrder }),
-      }).catch(() => {});
-    } catch {
-      // Ignore offline / client fallback
-    }
+    syncOrderToBackend(newOrder);
 
     // Play KOT alert sound
     soundEffects.playKOTAlert();
@@ -391,6 +433,14 @@ export const POSProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
     // Deduct raw ingredients
     deductInventoryForOrder(targetOrder.items);
+
+    // Sync approved online order to PostgreSQL
+    syncOrderToBackend({
+      ...targetOrder,
+      approvalStatus: 'approved',
+      status: 'sent_to_kitchen',
+      kotFiredAt: now,
+    });
 
     // Play KOT chime to signal kitchen
     soundEffects.playKOTAlert();
@@ -550,6 +600,7 @@ export const POSProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     };
 
     setBulkOrders((prev) => [newBulkOrder, ...prev]);
+    syncOrderToBackend(newBulkOrder);
   };
 
   const updateBulkMilestone = (orderId: string, milestoneId: string, completed: boolean) => {
@@ -606,11 +657,25 @@ export const POSProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           )
         );
       }
+      syncOrderToBackend({
+        ...targetOrder,
+        status: 'completed',
+        paymentDetails,
+      });
       closePaymentModal();
       return;
     }
 
     // Check bulk orders
+    const targetBulk = bulkOrders.find((o) => o.id === orderId);
+    if (targetBulk) {
+      syncOrderToBackend({
+        ...targetBulk,
+        balancePaymentDue: 0,
+        paymentDetails,
+        status: 'completed',
+      });
+    }
     setBulkOrders((prev) =>
       prev.map((ord) =>
         ord.id === orderId
