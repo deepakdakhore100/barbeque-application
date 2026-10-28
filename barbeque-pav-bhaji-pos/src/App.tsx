@@ -13,6 +13,7 @@ import { OnlineOrderHub } from './components/online/OnlineOrderHub';
 import { BulkCateringView } from './components/bulk/BulkCateringView';
 import { InventoryTrackingView } from './components/inventory/InventoryTrackingView';
 import { SalesAnalyticsView } from './components/analytics/SalesAnalyticsView';
+import { DatabaseExplorerView } from './components/database/DatabaseExplorerView';
 import { PaymentModal } from './components/billing/PaymentModal';
 
 const MainContent: React.FC = () => {
@@ -27,6 +28,7 @@ const MainContent: React.FC = () => {
       {activeView === 'bulk_catering' && <BulkCateringView />}
       {activeView === 'inventory' && <InventoryTrackingView />}
       {activeView === 'analytics' && <SalesAnalyticsView />}
+      {activeView === 'database_sql' && <DatabaseExplorerView />}
       <PaymentModal />
     </main>
   );

@@ -156,4 +156,5 @@ export type ActiveAppView =
   | 'online_zomato'
   | 'bulk_catering'
   | 'inventory'
-  | 'analytics';
+  | 'analytics'
+  | 'database_sql';

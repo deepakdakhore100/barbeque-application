@@ -33,11 +33,13 @@ export async function downloadProjectZip() {
           recharts: '^3.10.1',
           tailwindcss: '^4.3.3',
           vite: '^8.3.0',
+          pg: '^8.13.1',
         },
         devDependencies: {
           '@types/express': '^4.17.21',
           '@types/jszip': '^3.4.1',
           '@types/node': '^22.14.0',
+          '@types/pg': '^8.11.10',
           '@types/react': '^19.3.0',
           '@types/react-dom': '^19.3.0',
           autoprefixer: '^10.4.21',

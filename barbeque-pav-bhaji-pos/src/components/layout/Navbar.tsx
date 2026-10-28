@@ -13,6 +13,7 @@ import {
   BarChart3,
   Flame,
   Download,
+  Database,
 } from 'lucide-react';
 import { downloadProjectZip } from '../../utils/zipExporter';
 
@@ -76,6 +77,11 @@ export const Navbar: React.FC = () => {
       view: 'analytics',
       label: 'Sales Report',
       icon: <BarChart3 className="w-4 h-4" />,
+    },
+    {
+      view: 'database_sql',
+      label: 'Postgres DB',
+      icon: <Database className="w-4 h-4 text-cyan-400" />,
     },
   ];
 

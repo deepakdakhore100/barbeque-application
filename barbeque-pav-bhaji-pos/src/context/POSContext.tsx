@@ -238,6 +238,17 @@ export const POSProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     // Deduct stock
     deductInventoryForOrder(items);
 
+    // Sync to PostgreSQL database in background
+    try {
+      fetch('/api/orders', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ order: newOrder }),
+      }).catch(() => {});
+    } catch {
+      // Ignore offline / client fallback
+    }
+
     // Play KOT alert sound
     soundEffects.playKOTAlert();
 
