@@ -207,7 +207,6 @@ app.listen(PORT, '0.0.0.0', () => {
     `# App URL & Port
 PORT=3000
 DATABASE_URL="postgresql://neondb_owner:npg_WwLSkUcfs0E9@ep-lively-truth-az3ifhzf-pooler.c-3.ap-southeast-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
-
 `
   );
 
