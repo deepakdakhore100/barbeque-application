@@ -8,7 +8,7 @@ const { Pool } = pg;
 // Default connection string
 let currentConnectionString =
   process.env.DATABASE_URL ||
-  'postgresql://neondb_owner:npg_wiT6Yh4sGSWl@ep-lively-truth-az3ifhzf-pooler.c-3.ap-southeast-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require';
+  'postgresql://neondb_owner:<dummy-password>@ep-lively-truth-az3ifhzf-pooler.c-3.ap-southeast-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require';
 
 
 export function getConnectionString(): string {

@@ -57,7 +57,7 @@ export const DatabaseExplorerView: React.FC = () => {
   const [queryResult, setQueryResult] = useState<QueryResult | null>(null);
 
   const neonConnectionString =
-    'postgresql://neondb_owner:npg_WwLSkUcfs0E9@ep-lively-truth-az3ifhzf-pooler.c-3.ap-southeast-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require';
+    'postgresql://neondb_owner:<dummy-password>@ep-lively-truth-az3ifhzf-pooler.c-3.ap-southeast-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require';
 
   const fetchStatus = async () => {
     setIsLoadingStatus(true);
