@@ -15,12 +15,50 @@ const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-let currentConnectionString =
+
+function cleanConnectionString(connStr) {
+  if (!connStr) return connStr;
+  let clean = connStr.trim();
+  // Strip channel_binding to prevent TLS handshake incompatibilities on poolers
+  clean = clean.replace(/([&?])channel_binding=[^&]+(&|$)/, '$1').replace(/\?$/, '');
+  // Add uselibpqcompat=true if sslmode is specified to satisfy modern pg driver without warning
+  if (clean.includes('sslmode=') && !clean.includes('uselibpqcompat=')) {
+    const separator = clean.includes('?') ? '&' : '?';
+    clean = `${clean}${separator}uselibpqcompat=true`;
+  }
+  return clean;
+}
+
+function replaceDbInUrl(connStr, newDbName) {
+  try {
+    const url = new URL(connStr);
+    url.pathname = `/${newDbName}`;
+    return url.toString();
+  } catch {
+    return connStr.replace(/\/[a-zA-Z0-9_.-]+(\?|$)/, `/${newDbName}$1`);
+  }
+}
+
+function extractDbName(connStr) {
+  try {
+    const url = new URL(connStr);
+    return url.pathname.replace(/^\//, '') || 'neondb';
+  } catch {
+    const match = connStr.match(/\/([a-zA-Z0-9_.-]+)(\?|$)/);
+    return match ? match[1] : 'neondb';
+  }
+}
+
+let configuredConnectionString =
   process.env.DATABASE_URL ||
-  'postgresql://neondb_owner:<Dummy-password>@ep-lively-truth-az3ifhzf-pooler.c-3.ap-southeast-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require';
+  'postgresql://neondb_owner:npg_WwLSkUcfs0E9@ep-lively-truth-az3ifhzf-pooler.c-3.ap-southeast-1.aws.neon.tech/Barbeque_ledger?sslmode=require';
+
+let activeDatabase = extractDbName(configuredConnectionString);
+let isFallbackActive = false;
+let currentConnectionString = configuredConnectionString;
 
 function createPool(connStr) {
-  const cleanConn = connStr.replace(/([&?])channel_binding=[^&]+(&|$)/, '$1').replace(/\?$/, '');
+  const cleanConn = cleanConnectionString(connStr);
   return new Pool({
     connectionString: cleanConn,
     ssl: { rejectUnauthorized: false },
@@ -31,9 +69,74 @@ function createPool(connStr) {
 }
 
 let pool = createPool(currentConnectionString);
+let connectionInitPromise = null;
+
+async function ensureConnectionReady() {
+  if (connectionInitPromise) {
+    return connectionInitPromise.then(() => ({ database: activeDatabase, fallback: isFallbackActive }));
+  }
+
+  connectionInitPromise = (async () => {
+    const targetDb = extractDbName(configuredConnectionString);
+    try {
+      const res = await pool.query('SELECT current_database() as db');
+      activeDatabase = res.rows[0].db;
+      isFallbackActive = activeDatabase.toLowerCase() !== targetDb.toLowerCase();
+      console.log(`[PostgreSQL] Connected directly to database "${activeDatabase}".`);
+    } catch (err) {
+      if (err.code === '3D000' || (err.message && err.message.toLowerCase().includes('does not exist'))) {
+        console.warn(`[PostgreSQL] Database "${targetDb}" does not exist on Neon.`);
+        const fallbackDb = targetDb.toLowerCase() === 'neondb' ? 'postgres' : 'neondb';
+        const fallbackUrl = replaceDbInUrl(configuredConnectionString, fallbackDb);
+        const fallbackPool = createPool(fallbackUrl);
+
+        let createdTarget = false;
+        try {
+          await fallbackPool.query(`CREATE DATABASE "${targetDb}"`);
+          console.log(`[PostgreSQL] Database "${targetDb}" created automatically on Neon.`);
+          createdTarget = true;
+        } catch (createErr) {
+          console.warn(`[PostgreSQL] Note: Auto-create database not permitted via pooler (${createErr.message}). Switching to default database "${fallbackDb}".`);
+        }
+
+        if (createdTarget) {
+          try {
+            await fallbackPool.end();
+          } catch {}
+          activeDatabase = targetDb;
+          isFallbackActive = false;
+        } else {
+          try {
+            await pool.end();
+          } catch {}
+          pool = fallbackPool;
+          currentConnectionString = fallbackUrl;
+          activeDatabase = fallbackDb;
+          isFallbackActive = true;
+          console.log(`[PostgreSQL] Active database set to "${fallbackDb}". All tables and orders will be safely persisted in "${fallbackDb}".`);
+        }
+      } else {
+        throw err;
+      }
+    }
+  })();
+
+  try {
+    await connectionInitPromise;
+  } catch (err) {
+    connectionInitPromise = null;
+    throw err;
+  }
+
+  return { database: activeDatabase, fallback: isFallbackActive };
+}
 
 // Schema creation
 async function ensureTables() {
+  await ensureConnectionReady().catch((e) => {
+    console.warn('[PostgreSQL] Pre-schema note:', e.message);
+  });
+
   const sql = `
     CREATE TABLE IF NOT EXISTS dining_tables (
       id VARCHAR(50) PRIMARY KEY,
@@ -44,6 +147,21 @@ async function ensureTables() {
       current_order_id VARCHAR(50),
       guest_count INT,
       assigned_captain VARCHAR(100),
+      seated_at TIMESTAMP WITH TIME ZONE,
+      created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS menu_items (
+      id VARCHAR(50) PRIMARY KEY,
+      name VARCHAR(150) NOT NULL,
+      category VARCHAR(50) NOT NULL,
+      price NUMERIC(10, 2) NOT NULL,
+      description TEXT,
+      image_url TEXT,
+      is_veg BOOLEAN DEFAULT TRUE,
+      is_jain_available BOOLEAN DEFAULT TRUE,
+      prep_time_minutes INT DEFAULT 8,
+      station VARCHAR(50) DEFAULT 'Tawa Griddle',
       created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
     );
 
@@ -84,9 +202,21 @@ async function ensureTables() {
       item_status VARCHAR(30) DEFAULT 'pending',
       created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
     );
+
+    CREATE TABLE IF NOT EXISTS payment_transactions (
+      id VARCHAR(50) PRIMARY KEY,
+      order_id VARCHAR(50),
+      method VARCHAR(30) NOT NULL DEFAULT 'UPI_QR',
+      transaction_id VARCHAR(100),
+      amount_paid NUMERIC(10, 2) NOT NULL DEFAULT 0,
+      cash_tendered NUMERIC(10, 2),
+      change_given NUMERIC(10, 2),
+      paid_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    );
   `;
   try {
     await pool.query(sql);
+    console.log(`[PostgreSQL] All schema tables confirmed in database "${activeDatabase}".`);
   } catch (e) {
     console.warn('Auto-schema note:', e.message);
   }
@@ -106,7 +236,11 @@ app.get('/health', (req, res) => {
 // Database status
 app.get('/api/database/status', async (req, res) => {
   try {
+    await ensureConnectionReady().catch(() => {});
     const timeRes = await pool.query('SELECT NOW() as current_time, current_database() as db_name, version() as pg_version');
+    activeDatabase = timeRes.rows[0].db_name;
+    const targetDb = extractDbName(configuredConnectionString);
+
     let totalOrders = 0;
     let totalTables = 0;
     let totalRevenue = 0;
@@ -130,6 +264,8 @@ app.get('/api/database/status', async (req, res) => {
       connected: true,
       time: timeRes.rows[0].current_time,
       database: timeRes.rows[0].db_name,
+      targetDatabase: targetDb,
+      fallbackActive: isFallbackActive,
       version: timeRes.rows[0].pg_version,
       stats: {
         totalOrders,
@@ -138,10 +274,19 @@ app.get('/api/database/status', async (req, res) => {
       },
     });
   } catch (err) {
+    const targetDb = extractDbName(configuredConnectionString);
+    let hint = err.message || String(err);
+    if (err.code === '28P01') {
+      hint = "Password authentication failed for user 'neondb_owner'. Neon passwords can be reset in console.neon.tech. Paste your fresh connection string in the Reconnect box.";
+    } else if (err.code === '3D000') {
+      hint = `Database "${targetDb}" does not exist on Neon yet. You can create database "${targetDb}" in Neon Console (Databases > New Database) or connect to default database "neondb".`;
+    }
     res.status(500).json({
       connected: false,
       error: err.message || String(err),
-      hint: err.code === '28P01' ? 'Password authentication failed. Please update password in Neon console.' : undefined,
+      targetDatabase: targetDb,
+      fallbackActive: isFallbackActive,
+      hint,
     });
   }
 });
@@ -155,15 +300,31 @@ app.post('/api/database/config', async (req, res) => {
     await pool.end();
   } catch {}
 
-  currentConnectionString = connectionString.trim();
+  configuredConnectionString = cleanConnectionString(connectionString);
+  currentConnectionString = configuredConnectionString;
+  activeDatabase = extractDbName(configuredConnectionString);
+  isFallbackActive = false;
+  connectionInitPromise = null;
   pool = createPool(currentConnectionString);
 
   try {
-    const test = await pool.query('SELECT NOW() as now, current_database() as db');
+    await ensureConnectionReady();
     await ensureTables();
-    res.json({ success: true, message: 'Connected to PostgreSQL successfully', db: test.rows[0].db });
+    res.json({
+      success: true,
+      connected: true,
+      message: 'Connected to PostgreSQL successfully',
+      database: activeDatabase,
+      targetDatabase: extractDbName(configuredConnectionString),
+      fallbackActive: isFallbackActive,
+    });
   } catch (err) {
-    res.status(400).json({ success: false, error: err.message || String(err) });
+    res.status(400).json({
+      success: false,
+      connected: false,
+      error: err.message || String(err),
+      hint: err.code === '28P01' ? 'Password authentication failed. Please update password in Neon console.' : undefined,
+    });
   }
 });
 
@@ -238,7 +399,8 @@ app.post('/api/orders', async (req, res) => {
         tax = EXCLUDED.tax,
         total = EXCLUDED.total,
         table_number = EXCLUDED.table_number,
-        captain_name = EXCLUDED.captain_name
+        captain_name = EXCLUDED.captain_name,
+        special_instructions = EXCLUDED.special_instructions
     `;
 
     const orderTime = order.createdAt ? new Date(order.createdAt).toISOString() : new Date().toISOString();
@@ -292,7 +454,7 @@ app.post('/api/orders', async (req, res) => {
       }
     }
 
-    res.json({ success: true, orderId: order.id });
+    res.json({ success: true, orderId: order.id, database: activeDatabase });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message || String(err) });
   }

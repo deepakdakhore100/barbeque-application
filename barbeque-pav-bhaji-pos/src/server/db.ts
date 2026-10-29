@@ -1,17 +1,63 @@
 import pg from 'pg';
 import dotenv from 'dotenv';
+import fs from 'fs';
 
 dotenv.config();
 
 const { Pool } = pg;
 
-// Default connection string
-let currentConnectionString =
+export function cleanConnectionString(connStr: string): string {
+  if (!connStr) return connStr;
+  let clean = connStr.trim();
+  // Strip channel_binding to prevent TLS handshake incompatibilities on poolers
+  clean = clean.replace(/([&?])channel_binding=[^&]+(&|$)/, '$1').replace(/\?$/, '');
+  // Add uselibpqcompat=true if sslmode is specified to satisfy modern pg driver without warning
+  if (clean.includes('sslmode=') && !clean.includes('uselibpqcompat=')) {
+    const separator = clean.includes('?') ? '&' : '?';
+    clean = `${clean}${separator}uselibpqcompat=true`;
+  }
+  return clean;
+}
+
+export function replaceDbInUrl(connStr: string, newDbName: string): string {
+  try {
+    const url = new URL(connStr);
+    url.pathname = `/${newDbName}`;
+    return url.toString();
+  } catch {
+    return connStr.replace(/\/[a-zA-Z0-9_.-]+(\?|$)/, `/${newDbName}$1`);
+  }
+}
+
+export function extractDbName(connStr: string): string {
+  try {
+    const url = new URL(connStr);
+    return url.pathname.replace(/^\//, '') || 'neondb';
+  } catch {
+    const match = connStr.match(/\/([a-zA-Z0-9_.-]+)(\?|$)/);
+    return match ? match[1] : 'neondb';
+  }
+}
+
+// Configured connection string (defaults to Barbeque_ledger on Neon)
+let configuredConnectionString =
   process.env.DATABASE_URL ||
-  'postgresql://neondb_owner:<dummy-password>@ep-lively-truth-az3ifhzf-pooler.c-3.ap-southeast-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require';
+  'postgresql://neondb_owner:npg_WwLSkUcfs0E9@ep-lively-truth-az3ifhzf-pooler.c-3.ap-southeast-1.aws.neon.tech/Barbeque_ledger?sslmode=require';
+
+let activeDatabase = extractDbName(configuredConnectionString);
+let isFallbackActive = false;
+let currentConnectionString = configuredConnectionString;
 
 export function getConnectionString(): string {
   return currentConnectionString;
+}
+
+export function getActiveDatabase(): string {
+  return activeDatabase;
+}
+
+export function getIsFallbackActive(): boolean {
+  return isFallbackActive;
 }
 
 export function getMaskedConnectionString(): string {
@@ -19,15 +65,12 @@ export function getMaskedConnectionString(): string {
     const url = new URL(currentConnectionString);
     return `${url.protocol}//${url.username}:****@${url.host}${url.pathname}${url.search}`;
   } catch {
-    return 'postgresql://neondb_owner:****@neon.tech/neondb';
+    return `postgresql://neondb_owner:****@neon.tech/${activeDatabase}`;
   }
 }
 
-export let pool = createPool(currentConnectionString);
-
-function createPool(connStr: string) {
-  // Strip channel_binding if present to avoid driver issues
-  const cleanConn = connStr.replace(/([&?])channel_binding=[^&]+(&|$)/, '$1').replace(/\?$/, '');
+export function createPool(connStr: string) {
+  const cleanConn = cleanConnectionString(connStr);
   return new Pool({
     connectionString: cleanConn,
     ssl: {
@@ -39,14 +82,111 @@ function createPool(connStr: string) {
   });
 }
 
+export let pool = createPool(currentConnectionString);
+
+let connectionInitPromise: Promise<void> | null = null;
+
+export async function ensureConnectionReady(): Promise<{ database: string; fallback: boolean }> {
+  if (connectionInitPromise) {
+    return connectionInitPromise.then(() => ({ database: activeDatabase, fallback: isFallbackActive }));
+  }
+
+  connectionInitPromise = (async () => {
+    const targetDb = extractDbName(configuredConnectionString);
+    try {
+      const res = await pool.query('SELECT current_database() as db');
+      activeDatabase = res.rows[0].db;
+      isFallbackActive = activeDatabase.toLowerCase() !== targetDb.toLowerCase();
+      console.log(`[PostgreSQL] Connected directly to database "${activeDatabase}".`);
+    } catch (err: any) {
+      // 3D000 = INVALID_CATALOG_NAME (database does not exist)
+      if (err.code === '3D000' || (err.message && err.message.toLowerCase().includes('does not exist'))) {
+        console.warn(`[PostgreSQL] Database "${targetDb}" does not exist on Neon.`);
+        const fallbackDb = targetDb.toLowerCase() === 'neondb' ? 'postgres' : 'neondb';
+        const fallbackUrl = replaceDbInUrl(configuredConnectionString, fallbackDb);
+        const fallbackPool = createPool(fallbackUrl);
+
+        let createdTarget = false;
+        try {
+          await fallbackPool.query(`CREATE DATABASE "${targetDb}"`);
+          console.log(`[PostgreSQL] Database "${targetDb}" created automatically on Neon.`);
+          createdTarget = true;
+        } catch (createErr: any) {
+          console.warn(`[PostgreSQL] Note: Auto-create database not permitted via pooler (${createErr.message}). Switching to default database "${fallbackDb}".`);
+        }
+
+        if (createdTarget) {
+          try {
+            await fallbackPool.end();
+          } catch {}
+          activeDatabase = targetDb;
+          isFallbackActive = false;
+        } else {
+          try {
+            await pool.end();
+          } catch {}
+          pool = fallbackPool;
+          currentConnectionString = fallbackUrl;
+          activeDatabase = fallbackDb;
+          isFallbackActive = true;
+          console.log(`[PostgreSQL] Active database set to "${fallbackDb}". All tables and orders will be safely persisted in "${fallbackDb}".`);
+        }
+      } else {
+        throw err;
+      }
+    }
+  })();
+
+  try {
+    await connectionInitPromise;
+  } catch (err) {
+    connectionInitPromise = null;
+    throw err;
+  }
+
+  return { database: activeDatabase, fallback: isFallbackActive };
+}
+
 export async function setDatabaseUrl(newUrl: string) {
-  currentConnectionString = newUrl.trim();
+  configuredConnectionString = cleanConnectionString(newUrl);
+  currentConnectionString = configuredConnectionString;
+  activeDatabase = extractDbName(configuredConnectionString);
+  isFallbackActive = false;
+  connectionInitPromise = null;
+
+  // Persist to .env file for restart longevity
+  try {
+    let envContent = '';
+    if (fs.existsSync('.env')) {
+      envContent = fs.readFileSync('.env', 'utf-8');
+      if (envContent.includes('DATABASE_URL=')) {
+        envContent = envContent.replace(/DATABASE_URL=.*/g, `DATABASE_URL="${configuredConnectionString}"`);
+      } else {
+        envContent += `\nDATABASE_URL="${configuredConnectionString}"\n`;
+      }
+    } else {
+      envContent = `DATABASE_URL="${configuredConnectionString}"\n`;
+    }
+    fs.writeFileSync('.env', envContent, 'utf-8');
+  } catch (e) {
+    console.warn('Could not write to .env:', e);
+  }
+
   try {
     await pool.end();
   } catch {
     // Ignore error closing old pool
   }
+
   pool = createPool(currentConnectionString);
+
+  try {
+    await ensureConnectionReady();
+    await initDatabaseSchema();
+  } catch (e: any) {
+    console.warn('[PostgreSQL] Reconnect schema init note:', e.message || e);
+  }
+
   return testConnection();
 }
 
@@ -59,24 +199,44 @@ export async function query(text: string, params?: unknown[]) {
 
 export async function testConnection() {
   try {
+    await ensureConnectionReady().catch(() => {});
     const res = await pool.query('SELECT NOW() as current_time, current_database() as db_name, version() as pg_version');
+    activeDatabase = res.rows[0].db_name;
+    const targetDb = extractDbName(configuredConnectionString);
     return {
       connected: true,
       time: res.rows[0].current_time,
       database: res.rows[0].db_name,
+      targetDatabase: targetDb,
+      fallbackActive: isFallbackActive,
       version: res.rows[0].pg_version,
       connectionUrl: getMaskedConnectionString(),
     };
   } catch (error: any) {
+    const targetDb = extractDbName(configuredConnectionString);
+    let hint = error.message || String(error);
+    if (error.code === '28P01') {
+      hint = "Password authentication failed for user 'neondb_owner'. Neon passwords can be reset in console.neon.tech. Paste your fresh connection string into the Reconnect form.";
+    } else if (error.code === '3D000') {
+      hint = `Database "${targetDb}" does not exist on Neon. You can create database "${targetDb}" in Neon Console (Databases > New Database) or connect to default database "neondb".`;
+    }
     return {
       connected: false,
       error: error.message || String(error),
+      code: error.code,
+      hint,
+      targetDatabase: targetDb,
+      fallbackActive: isFallbackActive,
       connectionUrl: getMaskedConnectionString(),
     };
   }
 }
 
 export async function initDatabaseSchema() {
+  await ensureConnectionReady().catch((e) => {
+    console.warn('[PostgreSQL] Pre-schema connection check note:', e.message);
+  });
+
   const schemaSql = `
     -- 1. Tables & Dining Layout
     CREATE TABLE IF NOT EXISTS dining_tables (
@@ -107,7 +267,7 @@ export async function initDatabaseSchema() {
         created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
     );
 
-    -- 3. In-Dine, Online & Bulk Orders (No restrictive FKs so all orders always insert cleanly)
+    -- 3. In-Dine, Online & Bulk Orders (Safe without restrictive FKs so all orders always record cleanly)
     CREATE TABLE IF NOT EXISTS orders (
         id VARCHAR(50) PRIMARY KEY,
         order_number VARCHAR(50) NOT NULL,
@@ -161,11 +321,16 @@ export async function initDatabaseSchema() {
   `;
 
   await pool.query(schemaSql);
-  return { success: true, message: 'Schema tables initialized successfully in Neon PostgreSQL' };
+  return {
+    success: true,
+    database: activeDatabase,
+    fallback: isFallbackActive,
+    message: `Schema tables initialized successfully in Neon PostgreSQL (database: "${activeDatabase}")`,
+  };
 }
 
 export async function insertOrderRecord(order: any) {
-  // Ensure tables exist first
+  // Ensure tables exist in active database first
   await initDatabaseSchema();
 
   const insertOrderSql = `
@@ -235,5 +400,5 @@ export async function insertOrderRecord(order: any) {
     }
   }
 
-  return { success: true, orderId: order.id };
+  return { success: true, orderId: order.id, database: activeDatabase };
 }

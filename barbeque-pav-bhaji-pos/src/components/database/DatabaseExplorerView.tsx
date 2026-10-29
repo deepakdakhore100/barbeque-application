@@ -1,20 +1,40 @@
 import React, { useState, useEffect } from 'react';
-import { usePOS } from '../../context/POSContext';
 import {
   Database,
-  Play,
+  Terminal,
   RotateCw,
+  UploadCloud,
   CheckCircle2,
   AlertCircle,
   Copy,
   Check,
-  Table as TableIcon,
-  Server,
-  Terminal,
+  Key,
   ExternalLink,
-  UploadCloud,
+  Table as TableIcon,
+  ChevronDown,
+  ChevronUp,
+  HelpCircle,
   Layers,
+  ArrowRightLeft,
 } from 'lucide-react';
+import { usePOS } from '../../context/POSContext';
+
+interface DatabaseStatus {
+  connected: boolean;
+  time?: string;
+  database?: string;
+  targetDatabase?: string;
+  fallbackActive?: boolean;
+  version?: string;
+  stats?: {
+    totalOrders: number;
+    totalTables: number;
+    totalRevenue: number;
+  };
+  error?: string;
+  hint?: string;
+  connectionUrl?: string;
+}
 
 interface QueryResult {
   success: boolean;
@@ -26,38 +46,29 @@ interface QueryResult {
   error?: string;
 }
 
-interface DBStatus {
-  connected: boolean;
-  time?: string;
-  database?: string;
-  version?: string;
-  connectionHost?: string;
-  error?: string;
-  stats?: {
-    totalOrders: number;
-    totalTables: number;
-    totalMenuItems: number;
-    totalRevenue: number;
-  };
-}
-
 export const DatabaseExplorerView: React.FC = () => {
-  const { orders } = usePOS();
-  const [dbStatus, setDbStatus] = useState<DBStatus | null>(null);
-  const [isLoadingStatus, setIsLoadingStatus] = useState<boolean>(true);
-  const [copiedPsql, setCopiedPsql] = useState<boolean>(false);
-  const [isSyncing, setIsSyncing] = useState<boolean>(false);
-  const [syncMessage, setSyncMessage] = useState<string | null>(null);
+  const { orders, onlineOrders, bulkOrders, syncAllOrdersToPostgres, clearOldOrders } = usePOS();
 
-  // SQL Query state
+  const [dbStatus, setDbStatus] = useState<DatabaseStatus | null>(null);
+  const [isLoadingStatus, setIsLoadingStatus] = useState<boolean>(false);
+  const [isSyncing, setIsSyncing] = useState<boolean>(false);
+  const [syncMessage, setSyncMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+
+  // Reconnection input state
+  const [inputConnString, setInputConnString] = useState<string>('');
+  const [isReconnecting, setIsReconnecting] = useState<boolean>(false);
+  const [showRenderGuide, setShowRenderGuide] = useState<boolean>(false);
+  const [copiedPsql, setCopiedPsql] = useState<boolean>(false);
+
+  // Interactive SQL Editor State
   const [sqlQuery, setSqlQuery] = useState<string>(
     `SELECT id, order_number, order_type, table_number, captain_name, status, total, created_at \nFROM orders \nORDER BY created_at DESC \nLIMIT 10;`
   );
   const [isExecuting, setIsExecuting] = useState<boolean>(false);
   const [queryResult, setQueryResult] = useState<QueryResult | null>(null);
 
-  const neonConnectionString =
-    'postgresql://neondb_owner:<dummy-password>@ep-lively-truth-az3ifhzf-pooler.c-3.ap-southeast-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require';
+  const defaultNeonConnection =
+    'postgresql://neondb_owner:YOUR_PASSWORD@ep-lively-truth-az3ifhzf-pooler.c-3.ap-southeast-1.aws.neon.tech/neondb?sslmode=require';
 
   const fetchStatus = async () => {
     setIsLoadingStatus(true);
@@ -66,7 +77,11 @@ export const DatabaseExplorerView: React.FC = () => {
       const data = await res.json();
       setDbStatus(data);
     } catch (err: any) {
-      setDbStatus({ connected: false, error: err.message || 'Cannot reach API backend' });
+      setDbStatus({
+        connected: false,
+        error: err.message || 'Cannot reach API backend',
+        database: 'neondb',
+      });
     } finally {
       setIsLoadingStatus(false);
     }
@@ -74,7 +89,6 @@ export const DatabaseExplorerView: React.FC = () => {
 
   useEffect(() => {
     fetchStatus();
-    // Execute default query on load
     handleRunQuery(sqlQuery);
   }, []);
 
@@ -99,90 +113,178 @@ export const DatabaseExplorerView: React.FC = () => {
     }
   };
 
-  const handleSyncOrdersToPostgres = async () => {
+  const handleSyncOrders = async () => {
     setIsSyncing(true);
     setSyncMessage(null);
-    let successCount = 0;
     try {
-      for (const order of orders) {
-        const res = await fetch('/api/orders', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ order }),
+      const result = await syncAllOrdersToPostgres();
+      if (result.success) {
+        setSyncMessage({
+          type: 'success',
+          text: `Successfully synced ${result.count} orders to database '${dbStatus?.database || 'PostgreSQL'}'!`,
         });
-        if (res.ok) successCount++;
+        fetchStatus();
+        handleRunQuery();
+      } else {
+        setSyncMessage({
+          type: 'error',
+          text: `Sync failed: ${result.error || 'Check database credentials'}`,
+        });
       }
-      setSyncMessage(`Successfully synced ${successCount} orders to Neon PostgreSQL!`);
-      fetchStatus();
-      handleRunQuery();
     } catch (err: any) {
-      setSyncMessage(`Sync failed: ${err.message || err}`);
+      setSyncMessage({
+        type: 'error',
+        text: `Sync failed: ${err.message || String(err)}`,
+      });
     } finally {
       setIsSyncing(false);
     }
   };
 
+  const handleReconnectWith = async (targetConn: string) => {
+    setIsReconnecting(true);
+    setSyncMessage(null);
+
+    try {
+      const res = await fetch('/api/database/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ connectionString: targetConn }),
+      });
+      const data = await res.json();
+
+      if (data.connected || data.success) {
+        setSyncMessage({
+          type: 'success',
+          text: `Connected to database '${data.database}'! Now backfilling orders...`,
+        });
+
+        // Automatically backfill all existing orders
+        const syncRes = await syncAllOrdersToPostgres();
+        setSyncMessage({
+          type: 'success',
+          text: `Connected to database '${data.database}'! Successfully synced ${syncRes.count} orders into table 'orders'.`,
+        });
+
+        fetchStatus();
+        handleRunQuery();
+        setInputConnString('');
+      } else {
+        setSyncMessage({
+          type: 'error',
+          text: `Connection failed: ${data.error || 'Check Neon password & database name'}`,
+        });
+      }
+    } catch (err: any) {
+      setSyncMessage({
+        type: 'error',
+        text: `Reconnect error: ${err.message || String(err)}`,
+      });
+    } finally {
+      setIsReconnecting(false);
+    }
+  };
+
+  const handleReconnect = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!inputConnString.trim()) return;
+
+    let finalConn = inputConnString.trim();
+
+    // If user only pasted a raw password (e.g., npg_xxx), format it into the full URL
+    if (!finalConn.startsWith('postgres://') && !finalConn.startsWith('postgresql://')) {
+      const targetDb = dbStatus?.database || 'neondb';
+      finalConn = `postgresql://neondb_owner:${encodeURIComponent(
+        finalConn
+      )}@ep-lively-truth-az3ifhzf-pooler.c-3.ap-southeast-1.aws.neon.tech/${targetDb}?sslmode=require`;
+    }
+
+    await handleReconnectWith(finalConn);
+  };
+
   const presetQueries = [
     {
-      title: 'Recent Orders',
-      sql: `SELECT id, order_number, order_type, table_number, captain_name, status, total, created_at FROM orders ORDER BY created_at DESC LIMIT 10;`,
+      title: 'Check Databases on Neon',
+      sql: `SELECT datname FROM pg_database WHERE datistemplate = false;`,
     },
     {
-      title: 'Order Items & Spice Levels',
-      sql: `SELECT oi.order_id, o.order_number, oi.name, oi.quantity, oi.spice_level, oi.butter_preference, oi.price FROM order_items oi JOIN orders o ON oi.order_id = o.id ORDER BY o.created_at DESC LIMIT 15;`,
+      title: 'Recent Orders (orders)',
+      sql: `SELECT id, order_number, order_type, table_number, captain_name, status, total, created_at \nFROM orders \nORDER BY created_at DESC \nLIMIT 15;`,
     },
     {
-      title: 'Revenue Summary by Order Type',
-      sql: `SELECT order_type, count(*) as total_orders, sum(total) as gross_revenue, round(avg(total), 2) as average_order_value FROM orders GROUP BY order_type ORDER BY gross_revenue DESC;`,
+      title: 'Dishes & Modifiers (order_items)',
+      sql: `SELECT oi.order_id, o.order_number, oi.name, oi.quantity, oi.spice_level, oi.butter_preference, oi.price \nFROM order_items oi \nJOIN orders o ON oi.order_id = o.id \nORDER BY o.created_at DESC \nLIMIT 20;`,
     },
     {
-      title: 'Dining Tables & Sections',
-      sql: `SELECT id, number, section, capacity, status, guest_count, assigned_captain FROM dining_tables ORDER BY number;`,
+      title: 'Revenue by Channel',
+      sql: `SELECT order_type, count(*) as order_count, sum(total) as gross_revenue, round(avg(total), 2) as avg_order \nFROM orders \nGROUP BY order_type \nORDER BY gross_revenue DESC;`,
     },
     {
-      title: 'Active Menu Items Matrix',
-      sql: `SELECT id, name, category, price, station, prep_time_minutes, is_jain_available FROM menu_items ORDER BY category, price;`,
+      title: 'Orders by Status',
+      sql: `SELECT status, count(*) as count, sum(total) as total_amount \nFROM orders \nGROUP BY status \nORDER BY count DESC;`,
+    },
+    {
+      title: 'Count Rows in All Tables',
+      sql: `SELECT 'orders' as table_name, count(*) as row_count FROM orders \nUNION ALL \nSELECT 'order_items', count(*) FROM order_items \nUNION ALL \nSELECT 'dining_tables', count(*) FROM dining_tables;`,
+    },
+    {
+      title: 'Clear Old Orders in DB (>7 days)',
+      sql: `DELETE FROM orders \nWHERE status IN ('completed', 'cancelled', 'served') \n  AND created_at < NOW() - INTERVAL '7 days' \nRETURNING id, order_number, status, created_at;`,
+    },
+    {
+      title: 'Public Tables in Schema',
+      sql: `SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' ORDER BY table_name;`,
     },
   ];
 
   const handleCopyPsql = () => {
-    navigator.clipboard.writeText(`psql "${neonConnectionString}"`);
+    const activeDb = dbStatus?.database || 'neondb';
+    navigator.clipboard.writeText(`psql "postgresql://neondb_owner:YOUR_PASSWORD@ep-lively-truth-az3ifhzf-pooler.c-3.ap-southeast-1.aws.neon.tech/${activeDb}?sslmode=require"`);
     setCopiedPsql(true);
     setTimeout(() => setCopiedPsql(false), 2000);
   };
+
+  const totalAppOrders = orders.length + onlineOrders.filter((o) => o.approvalStatus === 'approved').length + bulkOrders.length;
 
   return (
     <div className="space-y-6">
       {/* Header Banner */}
       <div className="bg-neutral-900 border border-neutral-800 rounded-2xl p-5 flex flex-col md:flex-row items-start md:items-center justify-between gap-4 shadow-sm">
         <div className="flex items-center gap-3">
-          <div className="w-10 h-10 rounded-xl bg-cyan-500/10 border border-cyan-500/30 flex items-center justify-center text-cyan-400">
+          <div className="w-10 h-10 rounded-xl bg-cyan-500/10 border border-cyan-500/30 flex items-center justify-center text-cyan-400 shrink-0">
             <Database className="w-6 h-6" />
           </div>
           <div>
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2 flex-wrap">
               <h2 className="text-xl font-bold text-white tracking-tight">
-                Neon PostgreSQL Database Explorer
+                Neon PostgreSQL Explorer: <span className="text-amber-400 font-mono">{dbStatus?.database || 'neondb'}</span>
               </h2>
               {dbStatus?.connected ? (
                 <span className="text-xs bg-emerald-500/10 text-emerald-400 font-semibold px-2.5 py-0.5 rounded border border-emerald-500/20 flex items-center gap-1">
                   <CheckCircle2 className="w-3.5 h-3.5" />
-                  <span>Connected (Neon AWS)</span>
+                  <span>Connected ({dbStatus.database})</span>
                 </span>
               ) : (
                 <span className="text-xs bg-rose-500/10 text-rose-400 font-semibold px-2.5 py-0.5 rounded border border-rose-500/20 flex items-center gap-1">
                   <AlertCircle className="w-3.5 h-3.5" />
-                  <span>Checking Connection</span>
+                  <span>Auth Rejected / Reconnect Needed</span>
+                </span>
+              )}
+
+              {dbStatus?.fallbackActive && (
+                <span className="text-xs bg-cyan-500/10 text-cyan-400 font-semibold px-2.5 py-0.5 rounded border border-cyan-500/20 flex items-center gap-1">
+                  <ArrowRightLeft className="w-3.5 h-3.5" />
+                  <span>Auto-Fallback Active ({dbStatus.database})</span>
                 </span>
               )}
             </div>
             <p className="text-xs text-neutral-400 mt-1">
-              Direct connection to your PostgreSQL cloud instance. Query live orders, verify transactions, and run SQL statements.
+              Live queries, schema tables, and two-way sync between your POS front-end, Render deployment, and Neon PostgreSQL database.
             </p>
           </div>
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap">
           <button
             onClick={fetchStatus}
             disabled={isLoadingStatus}
@@ -193,96 +295,177 @@ export const DatabaseExplorerView: React.FC = () => {
           </button>
 
           <button
-            onClick={handleSyncOrdersToPostgres}
+            onClick={handleSyncOrders}
             disabled={isSyncing}
             className="px-4 py-2 bg-amber-500 hover:bg-amber-400 text-neutral-950 font-bold text-xs rounded-xl flex items-center gap-1.5 shadow-md transition-colors"
           >
             <UploadCloud className="w-4 h-4" />
-            <span>{isSyncing ? 'Syncing...' : 'Sync Active Orders to Postgres'}</span>
+            <span>{isSyncing ? 'Syncing...' : `Sync All ${totalAppOrders} Orders to Postgres`}</span>
           </button>
         </div>
       </div>
 
-      {/* Connection Diagnostic Alert if disconnected */}
-      {dbStatus && !dbStatus.connected && (
-        <div className="p-4 bg-rose-950/40 border border-rose-800/60 rounded-2xl text-xs space-y-3">
-          <div className="flex items-start gap-2.5">
-            <AlertCircle className="w-5 h-5 text-rose-400 shrink-0 mt-0.5" />
-            <div>
-              <span className="font-bold text-rose-200 text-sm block">
-                PostgreSQL Connection Notice
-              </span>
-              <p className="text-rose-300/90 mt-1">
-                {dbStatus.error || 'Cannot authenticate with Neon PostgreSQL.'}
-              </p>
-              {dbStatus.error?.includes('password authentication failed') && (
-                <p className="text-neutral-300 mt-2 bg-black/40 p-2.5 rounded-xl border border-rose-900/50">
-                  💡 <strong>How to resolve:</strong> Neon accounts automatically rotate or generate new passwords when a branch is reset. Go to <a href="https://console.neon.tech" target="_blank" rel="noreferrer" className="text-amber-400 underline font-semibold">console.neon.tech</a>, click <strong>&quot;Connection Details&quot;</strong>, copy your connection string, and paste it below.
-                </p>
-              )}
+      {/* Sync Status Banner */}
+      {syncMessage && (
+        <div
+          className={`p-3.5 rounded-xl border flex items-center gap-2.5 text-xs font-medium shadow-sm animate-in fade-in ${
+            syncMessage.type === 'success'
+              ? 'bg-emerald-950/60 border-emerald-800/60 text-emerald-300'
+              : 'bg-rose-950/60 border-rose-800/60 text-rose-300'
+          }`}
+        >
+          {syncMessage.type === 'success' ? (
+            <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+          ) : (
+            <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
+          )}
+          <span>{syncMessage.text}</span>
+        </div>
+      )}
+
+      {/* Catalog & Fallback Insight Card */}
+      {dbStatus?.fallbackActive && (
+        <div className="p-4 bg-cyan-950/40 border border-cyan-800/60 rounded-2xl flex items-start gap-3 text-xs text-cyan-200">
+          <Layers className="w-5 h-5 text-cyan-400 shrink-0 mt-0.5" />
+          <div className="space-y-1">
+            <span className="font-bold text-cyan-300 text-sm">
+              Auto-Catalog Resilience Active: Connected to &ldquo;{dbStatus.database}&rdquo;
+            </span>
+            <p className="text-cyan-200/90 leading-relaxed">
+              Target database &ldquo;<code className="text-white font-mono">{dbStatus.targetDatabase || 'Barbeque_ledger'}</code>&rdquo; does not exist on Neon yet. The server automatically connected to default database &ldquo;<code className="text-white font-mono">{dbStatus.database}</code>&rdquo;, initialized all tables (<code className="font-mono">orders</code>, <code className="font-mono">order_items</code>, <code className="font-mono">dining_tables</code>), and is actively saving orders here without interruption!
+            </p>
+            <p className="text-neutral-400 text-[11px] pt-1">
+              Want a dedicated database strictly named <span className="text-amber-400 font-semibold">Barbeque_ledger</span>? Simply open <a href="https://console.neon.tech" target="_blank" rel="noreferrer" className="text-cyan-400 underline font-semibold">console.neon.tech</a> &rarr; Databases &rarr; New Database &rarr; enter &ldquo;Barbeque_ledger&rdquo;. The app will automatically connect to it!
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* Connection Diagnostic / Reconnect Station */}
+      <div className="bg-neutral-900 border border-neutral-800 rounded-2xl p-5 space-y-4 shadow-sm">
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <div className="flex items-center gap-2">
+              <Key className="w-4 h-4 text-amber-400" />
+              <h3 className="text-sm font-bold text-white uppercase tracking-wider">
+                Neon Credentials &amp; Database Target
+              </h3>
             </div>
+            <p className="text-xs text-neutral-400 mt-1">
+              If Neon rotated your password (error <code className="text-rose-400 font-mono">28P01</code>) or you want to switch databases, paste your fresh connection string or password below.
+            </p>
           </div>
 
-          {/* Direct Connection String Updater */}
-          <form
-            onSubmit={async (e) => {
-              e.preventDefault();
-              const form = e.target as HTMLFormElement;
-              const input = form.elements.namedItem('conn') as HTMLInputElement;
-              if (!input.value.trim()) return;
-              try {
-                const res = await fetch('/api/database/config', {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ connectionString: input.value.trim() }),
-                });
-                const data = await res.json();
-                if (data.connected || data.success) {
-                  alert('Connected to PostgreSQL successfully!');
-                  fetchStatus();
-                  handleRunQuery();
-                } else {
-                  alert(`Connection failed: ${data.error || 'Check credentials'}`);
-                }
-              } catch (err: any) {
-                alert(`Error: ${err.message}`);
-              }
-            }}
-            className="flex flex-col sm:flex-row gap-2 pt-2 border-t border-rose-900/40"
+          <button
+            onClick={() => setShowRenderGuide(!showRenderGuide)}
+            className="text-xs text-cyan-400 hover:text-cyan-300 flex items-center gap-1 font-semibold shrink-0"
           >
+            <HelpCircle className="w-3.5 h-3.5" />
+            <span>Render Deployment Guide</span>
+            {showRenderGuide ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+          </button>
+        </div>
+
+        {/* Diagnostic info if disconnected */}
+        {dbStatus && !dbStatus.connected && (
+          <div className="p-3.5 bg-rose-950/40 border border-rose-800/60 rounded-xl text-xs space-y-2 text-rose-200">
+            <div className="flex items-start gap-2">
+              <AlertCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+              <div>
+                <span className="font-bold text-rose-300">Why are new orders not showing in Neon?</span>
+                <p className="text-rose-200/90 mt-0.5">
+                  {dbStatus.error || 'Connection rejected by Neon PostgreSQL.'}
+                </p>
+              </div>
+            </div>
+            <div className="text-neutral-300 bg-black/40 p-2.5 rounded-lg border border-neutral-800 space-y-1">
+              <div>💡 <strong>Troubleshooting Guide:</strong></div>
+              <div>
+                1. <strong>Password Expired:</strong> Neon automatically resets passwords when a branch or compute endpoint is changed (error <code className="text-amber-300 font-mono">28P01</code>). Paste your new password below.
+              </div>
+              <div>
+                2. <strong>Database Catalog:</strong> Neon creates database <code className="text-amber-300 font-mono">neondb</code> by default. If <code className="text-amber-300 font-mono">Barbeque_ledger</code> does not exist, the app will auto-fallback to <code className="text-amber-300 font-mono">neondb</code>.
+              </div>
+              <div>
+                3. <strong>Render Environment:</strong> Ensure <code className="text-amber-300 font-mono">DATABASE_URL</code> is set in Render Dashboard Environment variables.
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Reconnect Form */}
+        <form onSubmit={handleReconnect} className="space-y-3">
+          <div className="flex flex-col sm:flex-row gap-2">
             <input
-              name="conn"
               type="text"
-              placeholder="Paste updated postgresql://neondb_owner:PASSWORD@.../neondb?sslmode=require"
-              defaultValue={neonConnectionString}
-              className="flex-1 bg-black border border-neutral-700 text-white font-mono text-[11px] rounded-xl px-3 py-2 focus:outline-none focus:border-amber-500"
+              value={inputConnString}
+              onChange={(e) => setInputConnString(e.target.value)}
+              placeholder="Paste fresh Neon connection string OR password (e.g. npg_...)"
+              className="flex-1 bg-neutral-950 border border-neutral-750 text-white font-mono text-xs rounded-xl px-3.5 py-2.5 focus:outline-none focus:border-amber-500 placeholder-neutral-500 selection:bg-neutral-800"
             />
             <button
               type="submit"
-              className="px-4 py-2 bg-amber-500 hover:bg-amber-400 text-neutral-950 font-bold text-xs rounded-xl shrink-0 transition-colors"
+              disabled={isReconnecting || !inputConnString.trim()}
+              className="px-5 py-2.5 bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-neutral-950 font-bold text-xs rounded-xl shrink-0 transition-colors flex items-center justify-center gap-1.5 shadow-md"
             >
-              Update &amp; Reconnect
+              <RotateCw className={`w-3.5 h-3.5 ${isReconnecting ? 'animate-spin' : ''}`} />
+              <span>{isReconnecting ? 'Testing & Connecting...' : 'Connect & Sync Orders'}</span>
             </button>
-          </form>
-        </div>
-      )}
+          </div>
+          <div className="text-[11px] text-neutral-400 flex items-center gap-1.5 flex-wrap">
+            <span>Tip: Go to</span>
+            <a
+              href="https://console.neon.tech"
+              target="_blank"
+              rel="noreferrer"
+              className="text-amber-400 hover:underline font-semibold flex items-center gap-0.5"
+            >
+              console.neon.tech <ExternalLink className="w-3 h-3" />
+            </a>
+            <span>&rarr; Select Project &rarr; Click &quot;Connection Details&quot; &rarr; Copy connection string.</span>
+          </div>
+        </form>
 
-      {syncMessage && (
-        <div className="p-3 bg-amber-950/30 border border-amber-900/40 text-amber-300 text-xs rounded-xl flex items-center gap-2">
-          <CheckCircle2 className="w-4 h-4 text-amber-400" />
-          <span>{syncMessage}</span>
-        </div>
-      )}
+        {/* Render.com Guide Drawer */}
+        {showRenderGuide && (
+          <div className="p-4 bg-neutral-950 border border-neutral-800 rounded-xl space-y-3 text-xs text-neutral-300">
+            <span className="font-bold text-white text-sm block">
+              How to configure your Render deployment:
+            </span>
+            <ol className="list-decimal list-inside space-y-1.5 text-neutral-300">
+              <li>
+                Log into <a href="https://dashboard.render.com" target="_blank" rel="noreferrer" className="text-cyan-400 underline font-semibold">dashboard.render.com</a>.
+              </li>
+              <li>
+                Click your web service (e.g. <strong className="text-white">barbeque-application</strong>).
+              </li>
+              <li>
+                Click <strong>&quot;Environment&quot;</strong> in the left sidebar menu.
+              </li>
+              <li>
+                Add or edit the environment variable:
+                <div className="mt-1 bg-black p-2.5 rounded-lg font-mono text-[11px] text-emerald-400 border border-neutral-800 select-all space-y-1">
+                  <div>Key: DATABASE_URL</div>
+                  <div>Value: postgresql://neondb_owner:YOUR_PASSWORD@ep-lively-truth-az3ifhzf-pooler.c-3.ap-southeast-1.aws.neon.tech/neondb?sslmode=require&amp;uselibpqcompat=true</div>
+                </div>
+              </li>
+              <li>
+                Click <strong>&quot;Save Changes&quot;</strong>. Render will restart your web service and immediately direct all new orders straight into Neon PostgreSQL!
+              </li>
+            </ol>
+          </div>
+        )}
+      </div>
 
-      {/* Connection & Live Stats Grid */}
+      {/* Live Stats Grid */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
         <div className="p-4 rounded-xl bg-neutral-900 border border-neutral-800">
-          <span className="text-xs font-medium text-neutral-400">Database Name</span>
-          <div className="text-base font-bold text-white mt-1 font-mono">
+          <span className="text-xs font-medium text-neutral-400">Active Database</span>
+          <div className="text-base font-bold text-amber-400 mt-1 font-mono truncate">
             {dbStatus?.database || 'neondb'}
           </div>
           <div className="text-[11px] text-neutral-500 mt-0.5 truncate">
-            ap-southeast-1 (AWS)
+            ap-southeast-1.aws.neon.tech
           </div>
         </div>
 
@@ -294,27 +477,42 @@ export const DatabaseExplorerView: React.FC = () => {
           <div className="text-[11px] text-neutral-400">Stored in table &lsquo;orders&rsquo;</div>
         </div>
 
-        <div className="p-4 rounded-xl bg-neutral-900 border border-neutral-800">
-          <span className="text-xs font-medium text-neutral-400">Floor Tables Configured</span>
-          <div className="text-2xl font-bold text-amber-400 mt-1 font-mono tabular-nums">
-            {dbStatus?.stats?.totalTables ?? '—'}
+        <div className="p-4 rounded-xl bg-neutral-900 border border-neutral-800 flex flex-col justify-between">
+          <div>
+            <span className="text-xs font-medium text-neutral-400">Orders in POS Memory</span>
+            <div className="text-2xl font-bold text-cyan-400 mt-1 font-mono tabular-nums">
+              {totalAppOrders}
+            </div>
+            <div className="text-[11px] text-neutral-400">Active state &amp; cache</div>
           </div>
-          <div className="text-[11px] text-neutral-400">Stored in &lsquo;dining_tables&rsquo;</div>
+          <button
+            onClick={() => {
+              const count = clearOldOrders(24);
+              setSyncMessage({
+                type: 'success',
+                text: `Cleared ${count} old finished order(s) (>24h) from local memory.`,
+              });
+            }}
+            className="mt-2 text-[10px] font-semibold text-neutral-400 hover:text-white bg-neutral-800 hover:bg-neutral-750 px-2 py-1 rounded transition-colors self-start"
+            title="Prune completed/cancelled orders older than 24 hours from local browser state"
+          >
+            Prune Old Finished (&gt;24h)
+          </button>
         </div>
 
         <div className="p-4 rounded-xl bg-neutral-900 border border-neutral-800">
-          <span className="text-xs font-medium text-neutral-400">Total Settled Value</span>
+          <span className="text-xs font-medium text-neutral-400">Settled Revenue in DB</span>
           <div className="text-2xl font-bold text-white mt-1 font-mono tabular-nums">
-            ₹{dbStatus?.stats?.totalRevenue ? dbStatus.stats.totalRevenue.toLocaleString('en-IN') : '—'}
+            ₹{dbStatus?.stats?.totalRevenue ? dbStatus.stats.totalRevenue.toLocaleString('en-IN') : '0'}
           </div>
-          <div className="text-[11px] text-neutral-400">Sum of orders total</div>
+          <div className="text-[11px] text-neutral-400">From &lsquo;orders.total&rsquo;</div>
         </div>
       </div>
 
       {/* Preset Queries Strip */}
       <div className="p-4 bg-neutral-900 border border-neutral-800 rounded-xl space-y-2">
         <span className="text-xs font-semibold text-neutral-300 block">
-          Quick Order & Analytics Queries (Click to load & run):
+          Quick Order &amp; Analytics Queries (Click to load &amp; run):
         </span>
         <div className="flex flex-wrap items-center gap-2">
           {presetQueries.map((pq) => (
@@ -339,7 +537,7 @@ export const DatabaseExplorerView: React.FC = () => {
           <div className="flex items-center gap-2">
             <Terminal className="w-4 h-4 text-amber-400" />
             <span className="text-xs font-bold text-white uppercase tracking-wider">
-              SQL Query Console (Neon PostgreSQL)
+              SQL Query Console (Neon &middot; {dbStatus?.database || 'neondb'})
             </span>
           </div>
 
@@ -348,7 +546,7 @@ export const DatabaseExplorerView: React.FC = () => {
             disabled={isExecuting}
             className="px-4 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs rounded-lg flex items-center gap-1.5 shadow-sm transition-all active:scale-98"
           >
-            <Play className={`w-3.5 h-3.5 ${isExecuting ? 'animate-spin' : ''}`} />
+            <PlayIcon isExecuting={isExecuting} />
             <span>{isExecuting ? 'Running...' : 'Run SQL'}</span>
           </button>
         </div>
@@ -359,7 +557,7 @@ export const DatabaseExplorerView: React.FC = () => {
             onChange={(e) => setSqlQuery(e.target.value)}
             rows={4}
             className="w-full bg-neutral-950 border border-neutral-800 text-emerald-400 font-mono text-xs rounded-xl p-3.5 focus:outline-none focus:border-amber-500 selection:bg-neutral-800"
-            placeholder="Type any SQL query, e.g. SELECT * FROM orders;"
+            placeholder="Type any SQL query, e.g. SELECT * FROM orders ORDER BY created_at DESC;"
           />
         </div>
 
@@ -416,7 +614,7 @@ export const DatabaseExplorerView: React.FC = () => {
             </div>
           ) : queryResult?.success ? (
             <div className="py-8 text-center text-xs text-neutral-500">
-              Query executed successfully. 0 rows returned.
+              Query executed successfully. 0 rows returned in table &lsquo;orders&rsquo;. Use &lsquo;Sync Orders&rsquo; button above to insert data.
             </div>
           ) : (
             <div className="py-8 text-center text-xs text-neutral-500">
@@ -430,17 +628,17 @@ export const DatabaseExplorerView: React.FC = () => {
       <div className="bg-neutral-900 border border-neutral-800 rounded-2xl p-5 space-y-4">
         <h3 className="text-sm font-bold text-white uppercase tracking-wider flex items-center gap-2">
           <Terminal className="w-4 h-4 text-cyan-400" />
-          <span>How to Query PostgreSQL Directly via Terminal / External Tools</span>
+          <span>How to Query Directly via Terminal (psql / DBeaver / pgAdmin)</span>
         </h3>
 
         <div className="space-y-3 text-xs">
           <div>
             <span className="text-neutral-300 font-semibold block mb-1">
-              Option 1: Using psql CLI (Terminal)
+              Using psql CLI in your terminal:
             </span>
             <div className="flex items-center gap-2">
               <code className="flex-1 bg-black text-emerald-400 p-2.5 rounded-xl border border-neutral-800 font-mono text-[11px] overflow-x-auto select-all">
-                psql &quot;{neonConnectionString}&quot;
+                psql &quot;{defaultNeonConnection}&quot;
               </code>
               <button
                 onClick={handleCopyPsql}
@@ -450,41 +648,14 @@ export const DatabaseExplorerView: React.FC = () => {
                 <span>{copiedPsql ? 'Copied!' : 'Copy psql'}</span>
               </button>
             </div>
-            <p className="text-neutral-500 text-[11px] mt-1">
-              Once connected in your terminal, run <code className="text-neutral-300">\dt</code> to list tables or <code className="text-neutral-300">SELECT * FROM orders;</code> to view orders.
-            </p>
           </div>
 
           <div>
             <span className="text-neutral-300 font-semibold block mb-1">
-              Option 2: Using Neon Web Console (Online SQL Editor)
+              Once connected, check your orders with:
             </span>
-            <p className="text-neutral-400 text-[11px]">
-              Log in to your Neon dashboard at <a href="https://console.neon.tech" target="_blank" rel="noreferrer" className="text-amber-400 underline">console.neon.tech</a>, select project &lsquo;ep-lively-truth&rsquo;, and open the <strong>SQL Editor</strong> tab to query tables with full graphical auto-complete.
-            </p>
-          </div>
-
-          <div>
-            <span className="text-neutral-300 font-semibold block mb-1">
-              Option 3: Using GUI Clients (DBeaver, TablePlus, pgAdmin)
-            </span>
-            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-[11px] text-neutral-400 pt-1 font-mono">
-              <div className="p-2 rounded bg-neutral-800 border border-neutral-700">
-                <span className="text-neutral-500 block text-[9px]">HOST</span>
-                <span className="text-neutral-250 truncate block">ep-lively-truth...neon.tech</span>
-              </div>
-              <div className="p-2 rounded bg-neutral-800 border border-neutral-700">
-                <span className="text-neutral-500 block text-[9px]">DATABASE</span>
-                <span className="text-neutral-250">neondb</span>
-              </div>
-              <div className="p-2 rounded bg-neutral-800 border border-neutral-700">
-                <span className="text-neutral-500 block text-[9px]">USER</span>
-                <span className="text-neutral-250">neondb_owner</span>
-              </div>
-              <div className="p-2 rounded bg-neutral-800 border border-neutral-700">
-                <span className="text-neutral-500 block text-[9px]">SSL MODE</span>
-                <span className="text-emerald-400 font-bold">Require</span>
-              </div>
+            <div className="bg-black text-amber-400 p-2.5 rounded-xl border border-neutral-800 font-mono text-[11px] select-all space-y-0.5">
+              <div>SELECT order_number, order_type, table_number, total, status FROM orders ORDER BY created_at DESC;</div>
             </div>
           </div>
         </div>
@@ -492,3 +663,14 @@ export const DatabaseExplorerView: React.FC = () => {
     </div>
   );
 };
+
+function PlayIcon({ isExecuting }: { isExecuting: boolean }) {
+  if (isExecuting) {
+    return <RotateCw className="w-3.5 h-3.5 animate-spin" />;
+  }
+  return (
+    <svg className="w-3.5 h-3.5 fill-current" viewBox="0 0 24 24">
+      <path d="M8 5v14l11-7z" />
+    </svg>
+  );
+}

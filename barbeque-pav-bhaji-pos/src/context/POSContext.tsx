@@ -48,6 +48,9 @@ interface POSContextType {
   // Kitchen Display System operations
   acknowledgeKitchenOrder: (orderId: string) => void;
   markKitchenOrderReady: (orderId: string) => void;
+  clearKitchenTicket: (orderId: string) => void;
+  clearAllReadyKitchenTickets: () => void;
+  clearOldOrders: (olderThanHours?: number) => number;
 
   // Online Zomato Operations
   approveOnlineOrder: (orderId: string) => void;
@@ -70,6 +73,11 @@ interface POSContextType {
   // Helpers
   getOrderById: (orderId: string) => Order | OnlineOrder | BulkCateringOrder | undefined;
   calculateOrderTotals: (items: OrderItem[]) => { subtotal: number; tax: number; total: number };
+
+  // PostgreSQL Sync Tracking
+  pgSyncError: string | null;
+  clearPgSyncError: () => void;
+  syncAllOrdersToPostgres: () => Promise<{ success: boolean; count: number; error?: string }>;
 }
 
 const POSContext = createContext<POSContextType | undefined>(undefined);
@@ -108,6 +116,8 @@ export const POSProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const saved = localStorage.getItem('bbq_inventory');
     return saved ? JSON.parse(saved) : INITIAL_INVENTORY;
   });
+
+  const [pgSyncError, setPgSyncError] = useState<string | null>(null);
 
   // Sync state to LocalStorage
   useEffect(() => {
@@ -180,16 +190,62 @@ export const POSProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       .catch(() => {});
   }, []);
 
+  const clearPgSyncError = () => {
+    setPgSyncError(null);
+  };
+
   // Helper to send order to PostgreSQL backend
   const syncOrderToBackend = async (order: any) => {
     try {
-      await fetch('/api/orders', {
+      const res = await fetch('/api/orders', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ order }),
       });
-    } catch {
-      // Offline fallback
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.success === false) {
+        const errMsg = data.error || `HTTP ${res.status}: Failed to insert order`;
+        console.warn('PostgreSQL write failed:', errMsg);
+        setPgSyncError(errMsg);
+      } else {
+        setPgSyncError(null);
+      }
+    } catch (err: any) {
+      console.warn('Network error saving to PostgreSQL:', err);
+      setPgSyncError(err.message || 'Cannot reach server');
+    }
+  };
+
+  // Sync all in-memory / local orders to PostgreSQL
+  const syncAllOrdersToPostgres = async (): Promise<{ success: boolean; count: number; error?: string }> => {
+    let count = 0;
+    try {
+      const allOrdersToSync = [
+        ...orders,
+        ...onlineOrders.filter((o) => o.approvalStatus === 'approved'),
+        ...bulkOrders,
+      ];
+
+      for (const ord of allOrdersToSync) {
+        const res = await fetch('/api/orders', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ order: ord }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (res.ok && data.success !== false) {
+          count++;
+        } else {
+          throw new Error(data.error || `HTTP ${res.status}: Failed to sync order ${ord.orderNumber}`);
+        }
+      }
+
+      setPgSyncError(null);
+      return { success: true, count };
+    } catch (err: any) {
+      const msg = err.message || String(err);
+      setPgSyncError(msg);
+      return { success: false, count, error: msg };
     }
   };
 
@@ -408,7 +464,94 @@ export const POSProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
   };
 
-  // Zomato Online Order: Owner Approval
+  // Kitchen Dismiss / Clear a single ready order from KDS view
+  const clearKitchenTicket = (orderId: string) => {
+    // If in-dine, transition food_ready -> served (removes it from active kitchen queue)
+    setOrders((prev) =>
+      prev.map((ord) =>
+        ord.id === orderId
+          ? {
+              ...ord,
+              status: ord.status === 'food_ready' ? ('served' as OrderStatus) : ord.status,
+            }
+          : ord
+      )
+    );
+
+    // If online, transition ready_to_dispatch -> dispatched
+    setOnlineOrders((prev) =>
+      prev.map((ord) =>
+        ord.id === orderId
+          ? {
+              ...ord,
+              status: ord.status === 'ready_to_dispatch' ? ('dispatched' as OrderStatus) : ord.status,
+            }
+          : ord
+      )
+    );
+
+    // If bulk catering, mark dispatched
+    setBulkOrders((prev) =>
+      prev.map((ord) =>
+        ord.id === orderId
+          ? {
+              ...ord,
+              status: ord.status === 'ready_to_dispatch' ? ('dispatched' as OrderStatus) : ord.status,
+            }
+          : ord
+      )
+    );
+  };
+
+  // Kitchen Clear All Ready Tickets at once
+  const clearAllReadyKitchenTickets = () => {
+    setOrders((prev) =>
+      prev.map((ord) =>
+        ord.status === 'food_ready' ? { ...ord, status: 'served' as OrderStatus } : ord
+      )
+    );
+
+    setOnlineOrders((prev) =>
+      prev.map((ord) =>
+        ord.status === 'ready_to_dispatch' ? { ...ord, status: 'dispatched' as OrderStatus } : ord
+      )
+    );
+
+    setBulkOrders((prev) =>
+      prev.map((ord) =>
+        ord.status === 'ready_to_dispatch' ? { ...ord, status: 'dispatched' as OrderStatus } : ord
+      )
+    );
+  };
+
+  // Clear completed or old orders from state array to reclaim memory
+  const clearOldOrders = (olderThanHours = 24): number => {
+    const cutoffTime = Date.now() - olderThanHours * 60 * 60 * 1000;
+    let clearedCount = 0;
+
+    setOrders((prev) => {
+      const remaining = prev.filter((o) => {
+        const orderTime = new Date(o.createdAt).getTime();
+        const isFinished = o.status === 'completed' || o.status === 'cancelled' || o.status === 'served';
+        if (isFinished && orderTime < cutoffTime) {
+          clearedCount++;
+          return false;
+        }
+        return true;
+      });
+      return remaining;
+    });
+
+    setOnlineOrders((prev) =>
+      prev.filter((o) => {
+        const orderTime = new Date(o.createdAt).getTime();
+        const isFinished = o.status === 'dispatched' || o.status === 'cancelled';
+        return !(isFinished && orderTime < cutoffTime);
+      })
+    );
+
+    return clearedCount;
+  };
   const approveOnlineOrder = (orderId: string) => {
     const now = new Date().toISOString();
     const targetOrder = onlineOrders.find((o) => o.id === orderId);
@@ -750,7 +893,7 @@ export const POSProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         tables,
         menuItems,
         orders,
-        onlineOrders,
+        onlineOrders, 
         bulkOrders,
         inventory,
         activeTableId,
@@ -767,6 +910,9 @@ export const POSProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         resetTable,
         acknowledgeKitchenOrder,
         markKitchenOrderReady,
+        clearKitchenTicket,
+        clearAllReadyKitchenTickets,
+        clearOldOrders,
         approveOnlineOrder,
         rejectOnlineOrder,
         markOnlineDispatched,
@@ -779,6 +925,9 @@ export const POSProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         addInventoryItem,
         getOrderById,
         calculateOrderTotals,
+        pgSyncError,
+        clearPgSyncError,
+        syncAllOrdersToPostgres,
       }}
     >
       {children}

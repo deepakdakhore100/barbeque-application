@@ -17,6 +17,10 @@ import {
   ChevronDown,
   ChevronUp,
   Filter,
+  Check,
+  Eye,
+  EyeOff,
+  Trash2,
 } from 'lucide-react';
 
 interface PendingItemSummary {
@@ -52,11 +56,15 @@ export const KitchenDisplayView: React.FC = () => {
     menuItems,
     acknowledgeKitchenOrder,
     markKitchenOrderReady,
+    clearKitchenTicket,
+    clearAllReadyKitchenTickets,
   } = usePOS();
 
   const [typeFilter, setTypeFilter] = useState<'all' | OrderType>('all');
   const [stationFilter, setStationFilter] = useState<string>('all');
   const [prepStatusFilter, setPrepStatusFilter] = useState<'all' | 'waiting' | 'preparing'>('all');
+  const [hideReadyTickets, setHideReadyTickets] = useState<boolean>(false);
+  const [ageFilter, setAgeFilter] = useState<'all' | '30' | '60' | '120'>('all');
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [highlightedItemName, setHighlightedItemName] = useState<string | null>(null);
   const [isSummaryExpanded, setIsSummaryExpanded] = useState<boolean>(true);
@@ -285,13 +293,33 @@ export const KitchenDisplayView: React.FC = () => {
     });
   }, [pendingSummaries, stationFilter, prepStatusFilter, searchQuery]);
 
-  // Filter tickets by source type
+  // Count tickets that are already marked ready / completed in kitchen
+  const readyTicketCount = useMemo(() => {
+    return allTickets.filter(
+      (t) => t.status === 'food_ready' || t.status === 'ready_to_dispatch'
+    ).length;
+  }, [allTickets]);
+
+  // Filter tickets by source type, ready state, and age cutoff
   const filteredTickets = useMemo(() => {
     return allTickets.filter((ticket) => {
+      // 1. Source type filter (In-Dine, Zomato, Bulk)
       if (typeFilter !== 'all' && ticket.type !== typeFilter) return false;
+
+      // 2. Clear / Hide ready tickets if toggle is enabled
+      const isReady = ticket.status === 'food_ready' || ticket.status === 'ready_to_dispatch';
+      if (hideReadyTickets && isReady) return false;
+
+      // 3. Clear / Filter out orders older than selected time window
+      if (ageFilter !== 'all') {
+        const orderTime = new Date(ticket.kotFiredAt || ticket.createdAt).getTime();
+        const elapsedMinutes = Math.max(0, Math.floor((currentTime.getTime() - orderTime) / (1000 * 60)));
+        if (elapsedMinutes > Number(ageFilter)) return false;
+      }
+
       return true;
     });
-  }, [allTickets, typeFilter]);
+  }, [allTickets, typeFilter, hideReadyTickets, ageFilter, currentTime]);
 
   // Batch action: Acknowledge all waiting tickets for an item
   const handleAcknowledgeItem = (summary: PendingItemSummary) => {
@@ -353,51 +381,114 @@ export const KitchenDisplayView: React.FC = () => {
           </div>
         </div>
 
-        {/* Source Filters */}
-        <div className="flex items-center gap-2 flex-wrap">
-          <button
-            onClick={() => setTypeFilter('all')}
-            className={`px-3 py-1.5 text-xs font-medium rounded-lg transition-colors ${
-              typeFilter === 'all'
-                ? 'bg-amber-500 text-neutral-950 font-bold'
-                : 'bg-neutral-800 text-neutral-400 hover:text-white'
-            }`}
-          >
-            All Tickets ({allTickets.length})
-          </button>
-          <button
-            onClick={() => setTypeFilter('in_dine')}
-            className={`px-3 py-1.5 text-xs font-medium rounded-lg transition-colors flex items-center gap-1.5 ${
-              typeFilter === 'in_dine'
-                ? 'bg-amber-500 text-neutral-950 font-bold'
-                : 'bg-neutral-800 text-neutral-400 hover:text-white'
-            }`}
-          >
-            <Utensils className="w-3.5 h-3.5" />
-            <span>In-Dine ({activeInDineOrders.length})</span>
-          </button>
-          <button
-            onClick={() => setTypeFilter('online_zomato')}
-            className={`px-3 py-1.5 text-xs font-medium rounded-lg transition-colors flex items-center gap-1.5 ${
-              typeFilter === 'online_zomato'
-                ? 'bg-amber-500 text-neutral-950 font-bold'
-                : 'bg-neutral-800 text-neutral-400 hover:text-white'
-            }`}
-          >
-            <ShoppingBag className="w-3.5 h-3.5" />
-            <span>Zomato ({activeOnlineOrders.length})</span>
-          </button>
-          <button
-            onClick={() => setTypeFilter('bulk_catering')}
-            className={`px-3 py-1.5 text-xs font-medium rounded-lg transition-colors flex items-center gap-1.5 ${
-              typeFilter === 'bulk_catering'
-                ? 'bg-amber-500 text-neutral-950 font-bold'
-                : 'bg-neutral-800 text-neutral-400 hover:text-white'
-            }`}
-          >
-            <Truck className="w-3.5 h-3.5" />
-            <span>Bulk ({activeBulkOrders.length})</span>
-          </button>
+        {/* Source Filters & Kitchen Clearing Controls */}
+        <div className="flex flex-col lg:flex-row items-start lg:items-center gap-3 flex-wrap">
+          <div className="flex items-center gap-1.5 flex-wrap">
+            <button
+              onClick={() => setTypeFilter('all')}
+              className={`px-3 py-1.5 text-xs font-medium rounded-lg transition-colors ${
+                typeFilter === 'all'
+                  ? 'bg-amber-500 text-neutral-950 font-bold'
+                  : 'bg-neutral-800 text-neutral-400 hover:text-white'
+              }`}
+            >
+              All Tickets ({allTickets.length})
+            </button>
+            <button
+              onClick={() => setTypeFilter('in_dine')}
+              className={`px-3 py-1.5 text-xs font-medium rounded-lg transition-colors flex items-center gap-1.5 ${
+                typeFilter === 'in_dine'
+                  ? 'bg-amber-500 text-neutral-950 font-bold'
+                  : 'bg-neutral-800 text-neutral-400 hover:text-white'
+              }`}
+            >
+              <Utensils className="w-3.5 h-3.5" />
+              <span>In-Dine ({activeInDineOrders.length})</span>
+            </button>
+            <button
+              onClick={() => setTypeFilter('online_zomato')}
+              className={`px-3 py-1.5 text-xs font-medium rounded-lg transition-colors flex items-center gap-1.5 ${
+                typeFilter === 'online_zomato'
+                  ? 'bg-amber-500 text-neutral-950 font-bold'
+                  : 'bg-neutral-800 text-neutral-400 hover:text-white'
+              }`}
+            >
+              <ShoppingBag className="w-3.5 h-3.5" />
+              <span>Zomato ({activeOnlineOrders.length})</span>
+            </button>
+            <button
+              onClick={() => setTypeFilter('bulk_catering')}
+              className={`px-3 py-1.5 text-xs font-medium rounded-lg transition-colors flex items-center gap-1.5 ${
+                typeFilter === 'bulk_catering'
+                  ? 'bg-amber-500 text-neutral-950 font-bold'
+                  : 'bg-neutral-800 text-neutral-400 hover:text-white'
+              }`}
+            >
+              <Truck className="w-3.5 h-3.5" />
+              <span>Bulk ({activeBulkOrders.length})</span>
+            </button>
+          </div>
+
+          {/* Stale & Ready Ticket Clearing Actions */}
+          <div className="flex items-center gap-2 border-t lg:border-t-0 lg:border-l border-neutral-800 pt-2 lg:pt-0 lg:pl-3 flex-wrap">
+            {/* Age Filter */}
+            <div className="flex items-center gap-1 bg-neutral-950 p-1 rounded-lg border border-neutral-800 text-xs">
+              <span className="text-neutral-500 text-[11px] px-1 font-medium">Age:</span>
+              <button
+                onClick={() => setAgeFilter('all')}
+                className={`px-2 py-0.5 rounded text-[11px] transition-colors ${
+                  ageFilter === 'all' ? 'bg-neutral-800 text-white font-bold' : 'text-neutral-400 hover:text-white'
+                }`}
+                title="Show all active orders regardless of order time"
+              >
+                All
+              </button>
+              <button
+                onClick={() => setAgeFilter('30')}
+                className={`px-2 py-0.5 rounded text-[11px] transition-colors ${
+                  ageFilter === '30' ? 'bg-neutral-800 text-white font-bold' : 'text-neutral-400 hover:text-white'
+                }`}
+                title="Hide orders older than 30 minutes"
+              >
+                &lt;30m
+              </button>
+              <button
+                onClick={() => setAgeFilter('60')}
+                className={`px-2 py-0.5 rounded text-[11px] transition-colors ${
+                  ageFilter === '60' ? 'bg-neutral-800 text-white font-bold' : 'text-neutral-400 hover:text-white'
+                }`}
+                title="Hide orders older than 60 minutes"
+              >
+                &lt;1h
+              </button>
+            </div>
+
+            {/* Toggle Hide Ready */}
+            <button
+              onClick={() => setHideReadyTickets(!hideReadyTickets)}
+              className={`px-2.5 py-1.5 text-xs font-semibold rounded-lg transition-colors flex items-center gap-1.5 border ${
+                hideReadyTickets
+                  ? 'bg-amber-500/20 text-amber-300 border-amber-500/40'
+                  : 'bg-neutral-800 text-neutral-300 border-neutral-700 hover:text-white'
+              }`}
+              title="Toggle to hide completed/ready tickets from the kitchen display"
+            >
+              {hideReadyTickets ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+              <span>{hideReadyTickets ? 'Ready Hidden' : 'Show Ready'}</span>
+            </button>
+
+            {/* Clear All Ready Tickets */}
+            {readyTicketCount > 0 && (
+              <button
+                onClick={clearAllReadyKitchenTickets}
+                className="px-2.5 py-1.5 text-xs font-bold rounded-lg bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-300 border border-emerald-500/40 flex items-center gap-1.5 transition-colors shadow-sm"
+                title="Dismiss all ready tickets from the kitchen display"
+              >
+                <Check className="w-3.5 h-3.5 text-emerald-400" />
+                <span>Clear Ready ({readyTicketCount})</span>
+              </button>
+            )}
+          </div>
         </div>
       </div>
 
@@ -1022,11 +1113,21 @@ export const KitchenDisplayView: React.FC = () => {
                   )}
 
                   {isReady && (
-                    <div className="py-1.5 px-3 bg-emerald-950/50 border border-emerald-800/60 text-emerald-400 text-xs font-semibold rounded-lg flex items-center justify-center gap-2">
-                      <CheckCircle className="w-4 h-4" />
-                      <span>
-                        {isOnline ? 'Ready for Rider Pickup' : 'Ready & Served'}
-                      </span>
+                    <div className="space-y-2">
+                      <div className="py-1.5 px-3 bg-emerald-950/50 border border-emerald-800/60 text-emerald-400 text-xs font-semibold rounded-lg flex items-center justify-center gap-2">
+                        <CheckCircle className="w-4 h-4" />
+                        <span>
+                          {isOnline ? 'Ready for Rider Pickup' : 'Ready & Served'}
+                        </span>
+                      </div>
+                      <button
+                        onClick={() => clearKitchenTicket(ticket.id)}
+                        className="w-full py-1.5 px-3 bg-neutral-800 hover:bg-neutral-700 active:bg-neutral-600 text-neutral-300 hover:text-white font-semibold text-xs rounded-lg flex items-center justify-center gap-1.5 transition-colors border border-neutral-700 shadow-sm"
+                        title="Clear and dismiss this order from the kitchen display"
+                      >
+                        <Check className="w-3.5 h-3.5 text-emerald-400" />
+                        <span>CLEAR TICKET FROM KDS</span>
+                      </button>
                     </div>
                   )}
                 </div>

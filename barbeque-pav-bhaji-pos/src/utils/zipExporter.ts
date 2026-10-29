@@ -189,12 +189,47 @@ const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-let currentConnectionString =
+let configuredConnectionString =
   process.env.DATABASE_URL ||
-  'postgresql://neondb_owner:<dummy-password>@ep-lively-truth-az3ifhzf-pooler.c-3.ap-southeast-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require';
+  'postgresql://neondb_owner:npg_WwLSkUcfs0E9@ep-lively-truth-az3ifhzf-pooler.c-3.ap-southeast-1.aws.neon.tech/Barbeque_ledger?sslmode=require';
+
+function cleanConnectionString(connStr) {
+  if (!connStr) return connStr;
+  let clean = connStr.trim();
+  clean = clean.replace(/([&?])channel_binding=[^&]+(&|$)/, '$1').replace(/\\?$/, '');
+  if (clean.includes('sslmode=') && !clean.includes('uselibpqcompat=')) {
+    const separator = clean.includes('?') ? '&' : '?';
+    clean = \`\${clean}\${separator}uselibpqcompat=true\`;
+  }
+  return clean;
+}
+
+function replaceDbInUrl(connStr, newDbName) {
+  try {
+    const url = new URL(connStr);
+    url.pathname = \`/\${newDbName}\`;
+    return url.toString();
+  } catch {
+    return connStr.replace(/\\/[a-zA-Z0-9_.-]+(\\?|$)/, \`/\${newDbName}$1\`);
+  }
+}
+
+function extractDbName(connStr) {
+  try {
+    const url = new URL(connStr);
+    return url.pathname.replace(/^\\//, '') || 'neondb';
+  } catch {
+    const match = connStr.match(/\\/([a-zA-Z0-9_.-]+)(\\?|$)/);
+    return match ? match[1] : 'neondb';
+  }
+}
+
+let activeDatabase = extractDbName(configuredConnectionString);
+let isFallbackActive = false;
+let currentConnectionString = configuredConnectionString;
 
 function createPool(connStr) {
-  const cleanConn = connStr.replace(/([&?])channel_binding=[^&]+(&|$)/, '$1').replace(/\\?$/, '');
+  const cleanConn = cleanConnectionString(connStr);
   return new Pool({
     connectionString: cleanConn,
     ssl: { rejectUnauthorized: false },
@@ -205,8 +240,67 @@ function createPool(connStr) {
 }
 
 let pool = createPool(currentConnectionString);
+let connectionInitPromise = null;
+
+async function ensureConnectionReady() {
+  if (connectionInitPromise) {
+    return connectionInitPromise.then(() => ({ database: activeDatabase, fallback: isFallbackActive }));
+  }
+
+  connectionInitPromise = (async () => {
+    const targetDb = extractDbName(configuredConnectionString);
+    try {
+      const res = await pool.query('SELECT current_database() as db');
+      activeDatabase = res.rows[0].db;
+      isFallbackActive = activeDatabase.toLowerCase() !== targetDb.toLowerCase();
+    } catch (err) {
+      if (err.code === '3D000' || (err.message && err.message.toLowerCase().includes('does not exist'))) {
+        console.warn(\`[PostgreSQL] Database "\${targetDb}" does not exist on Neon.\`);
+        const fallbackDb = targetDb.toLowerCase() === 'neondb' ? 'postgres' : 'neondb';
+        const fallbackUrl = replaceDbInUrl(configuredConnectionString, fallbackDb);
+        const fallbackPool = createPool(fallbackUrl);
+
+        let createdTarget = false;
+        try {
+          await fallbackPool.query(\`CREATE DATABASE "\${targetDb}"\`);
+          createdTarget = true;
+        } catch (createErr) {
+          console.warn(\`[PostgreSQL] Note: Auto-create database not permitted via pooler (\${createErr.message}). Switching to default database "\${fallbackDb}".\`);
+        }
+
+        if (createdTarget) {
+          try { await fallbackPool.end(); } catch {}
+          activeDatabase = targetDb;
+          isFallbackActive = false;
+        } else {
+          try { await pool.end(); } catch {}
+          pool = fallbackPool;
+          currentConnectionString = fallbackUrl;
+          activeDatabase = fallbackDb;
+          isFallbackActive = true;
+          console.log(\`[PostgreSQL] Active database set to "\${fallbackDb}". All tables and orders will be safely persisted in "\${fallbackDb}".\`);
+        }
+      } else {
+        throw err;
+      }
+    }
+  })();
+
+  try {
+    await connectionInitPromise;
+  } catch (err) {
+    connectionInitPromise = null;
+    throw err;
+  }
+
+  return { database: activeDatabase, fallback: isFallbackActive };
+}
 
 async function ensureTables() {
+  await ensureConnectionReady().catch((e) => {
+    console.warn('[PostgreSQL] Pre-schema note:', e.message);
+  });
+
   const sql = \`
     CREATE TABLE IF NOT EXISTS dining_tables (
       id VARCHAR(50) PRIMARY KEY,
@@ -276,6 +370,7 @@ app.get('/health', (req, res) => {
 
 app.get('/api/database/status', async (req, res) => {
   try {
+    await ensureConnectionReady().catch(() => {});
     const timeRes = await pool.query('SELECT NOW() as current_time, current_database() as db_name, version() as pg_version');
     const ordersCountRes = await pool.query('SELECT count(*) as total_orders FROM orders');
     const tablesCountRes = await pool.query('SELECT count(*) as total_tables FROM dining_tables');
@@ -285,6 +380,8 @@ app.get('/api/database/status', async (req, res) => {
       connected: true,
       time: timeRes.rows[0].current_time,
       database: timeRes.rows[0].db_name,
+      targetDatabase: extractDbName(configuredConnectionString),
+      fallbackActive: isFallbackActive,
       version: timeRes.rows[0].pg_version,
       stats: {
         totalOrders: parseInt(ordersCountRes.rows[0].total_orders, 10),
@@ -293,7 +390,7 @@ app.get('/api/database/status', async (req, res) => {
       },
     });
   } catch (err) {
-    res.status(500).json({ connected: false, error: err.message || String(err) });
+    res.status(500).json({ connected: false, error: err.message || String(err), fallbackActive: isFallbackActive });
   }
 });
 
@@ -303,12 +400,22 @@ app.post('/api/database/config', async (req, res) => {
   try {
     await pool.end();
   } catch {}
-  currentConnectionString = connectionString.trim();
+  configuredConnectionString = cleanConnectionString(connectionString);
+  currentConnectionString = configuredConnectionString;
+  activeDatabase = extractDbName(configuredConnectionString);
+  isFallbackActive = false;
+  connectionInitPromise = null;
   pool = createPool(currentConnectionString);
   try {
-    const test = await pool.query('SELECT NOW() as now, current_database() as db');
+    await ensureConnectionReady();
     await ensureTables();
-    res.json({ success: true, message: 'Connected to PostgreSQL successfully', db: test.rows[0].db });
+    res.json({
+      success: true,
+      connected: true,
+      message: 'Connected to PostgreSQL successfully',
+      database: activeDatabase,
+      fallbackActive: isFallbackActive,
+    });
   } catch (err) {
     res.status(400).json({ success: false, error: err.message || String(err) });
   }
