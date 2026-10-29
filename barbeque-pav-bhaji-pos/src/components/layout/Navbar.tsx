@@ -133,14 +133,14 @@ export const Navbar: React.FC = () => {
 
         {/* Zone 3: primary actions & sound alert toggler */}
         <div className="flex items-center gap-2.5 shrink-0">
-          {/* <button
+          <button
             onClick={downloadProjectZip}
             className="p-2 sm:px-3 sm:py-1.5 rounded-lg border border-neutral-700 bg-neutral-800 text-neutral-200 hover:text-white hover:bg-neutral-700 text-xs font-semibold flex items-center gap-1.5 transition-colors"
             title="Download full project codebase as ZIP file"
           >
             <Download className="w-3.5 h-3.5 text-amber-400" />
             <span className="hidden sm:inline">Download ZIP</span>
-          </button> */}
+          </button>
 
           <button
             onClick={() => setSoundEnabled(!soundEnabled)}
