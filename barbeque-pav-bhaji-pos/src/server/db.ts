@@ -7,7 +7,7 @@ const { Pool } = pg;
 
 // Default connection string
 let currentConnectionString =
-  process.env.DATABASE_URL;
+  process.env.DATABASE_URL ;
 
 export function getConnectionString(): string {
   return currentConnectionString;

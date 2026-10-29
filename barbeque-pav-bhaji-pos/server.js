@@ -16,7 +16,7 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 let currentConnectionString =
-  process.env.DATABASE_URL;
+  process.env.DATABASE_URL ;
 
 function createPool(connStr) {
   const cleanConn = connStr.replace(/([&?])channel_binding=[^&]+(&|$)/, '$1').replace(/\?$/, '');
